@@ -1,0 +1,40 @@
+name: Native caption lab (build only)
+on:
+  workflow_dispatch:
+    inputs:
+      paint:
+        description: 'Experimental paint (VM only); false = read-only probe'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build and test Rust renderer
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          cargo +stable-x86_64-pc-windows-gnu test --manifest-path MacTrafficNative/Cargo.toml --target x86_64-pc-windows-gnu
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $features = @()
+          if ('${{ inputs.paint }}' -eq 'true') { $features = @('--features','paint') }
+          cargo +stable-x86_64-pc-windows-gnu build --manifest-path MacTrafficNative/Cargo.toml --release --target x86_64-pc-windows-gnu @features
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build the upstream extension with the source bridge
+        shell: pwsh
+        run: |
+          msbuild ExplorerBlurMica.sln /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path artifact | Out-Null
+          Copy-Item build/x64/Release/ExplorerBlurMica.dll artifact/
+          Copy-Item MacTrafficNative/target/x86_64-pc-windows-gnu/release/mactraffic_caption.dll artifact/
+          Copy-Item build/x64/Release/config.ini artifact/
+          Copy-Item COPYING.LESSER,LICENSE artifact/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-lab-build-only
+          path: artifact/
