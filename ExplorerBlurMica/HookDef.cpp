@@ -734,7 +734,6 @@ namespace Hook
             }
         }
 
-        if (g_sysBuildNumber==18363) MacTrafficNative::PaintInCycle(hWnd, lpPaint);
         auto ribiter = m_ribbonPaint.find(curThread);
         if (ribiter != m_ribbonPaint.end())
             m_ribbonPaint.erase(ribiter);
@@ -792,7 +791,9 @@ namespace Hook
                 RECT rcWnd;
                 GetWindowRect(ribiter->second.first, &rcWnd);
 
-                if ((g_sysBuildNumber==18363 && MacTrafficNative::RibbonTitleFill(ribiter->second.first,lprc))
+                const HWND mtRibbon=ribiter->second.first;
+                const bool mtTitle=g_sysBuildNumber==18363 && MacTrafficNative::RibbonTitleFill(mtRibbon,lprc);
+                if (mtTitle
                     || lprc->bottom == CalcRibbonHeightForDPI(ribiter->second.first, 26, false)
                     || lprc->bottom == CalcRibbonHeightForDPI(ribiter->second.first, 23, false, false)
                     || lprc->bottom == 1
@@ -800,6 +801,11 @@ namespace Hook
                         && (rcWnd.right - rcWnd.left) == lprc->right))
                 {
                     hbr = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                }
+                if(mtTitle){
+                    const int ret=_FillRect_.Org(hDC,lprc,hbr);
+                    if(ret)MacTrafficNative::PaintRibbonBuffer(mtRibbon,hDC);
+                    return ret;
                 }
             }
         }

@@ -19,8 +19,9 @@ namespace MacTrafficNative {
         return api;
     }
     constexpr UINT kToggle=0x1e30;
-    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab037.State";
-    struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; int rightInset; int slotTop; int slotWidth; int slotHeight; bool accepted; };
+    constexpr UINT_PTR kPaintWatchdog=0x4d543038;
+    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab038.State";
+    struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; int rightInset; int slotTop; int slotWidth; int slotHeight; bool accepted; bool painted; };
     inline FrameState* State(HWND h) {return reinterpret_cast<FrameState*>(GetPropW(h,kProp));}
     inline bool Eligible(HWND h) {
         wchar_t cls[64]{};
@@ -62,54 +63,21 @@ namespace MacTrafficNative {
         auto s=reinterpret_cast<FrameState*>(RemovePropW(h,kProp));if(!s)return;
         const LONG_PTR caption=s->captionBits;const BOOL old=s->oldNcPaint;const bool restore=s->restoreNcPaint;
         delete s;
+        KillTimer(h,kPaintWatchdog);
         if(destroying)return;
         if(GetCapture()==h)ReleaseCapture();
         SetWindowLongPtrW(h,GWL_STYLE,(GetWindowLongPtrW(h,GWL_STYLE)&~static_cast<LONG_PTR>(WS_CAPTION))|caption);
         if(restore)DwmSetWindowAttribute(h,DWMWA_ALLOW_NCPAINT,&old,sizeof(old));
         Refresh(h);EnsureMenu(h);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);Event(6,2,0,0,0);
     }
-    // Select one actual client paint owner; never paint through a borrowed GetDC.
-    inline HWND PaintHost(HWND h, const RECT& band) {
-        POINT corners[2]={{band.left,band.top},{band.right-1,band.bottom-1}};
-        if(!ClientToScreen(h,&corners[0])||!ClientToScreen(h,&corners[1]))return nullptr;
-        POINT pt{band.right-MulDiv(26,Dpi(h),96), (band.top+band.bottom)/2};
-        if(!ClientToScreen(h,&pt))return nullptr;
-        HWND current=h;
-        for(int i=0;i<12;++i){
-            POINT local=pt; if(!ScreenToClient(current,&local))return nullptr;
-            HWND child=ChildWindowFromPointEx(current,local,CWP_SKIPINVISIBLE|CWP_SKIPTRANSPARENT);
-            if(!child||child==current)break;
-            if(GetWindowThreadProcessId(child,nullptr)!=GetCurrentThreadId())return nullptr;
-            POINT a=corners[0],b=corners[1];RECT client{};
-            if(!ScreenToClient(child,&a)||!ScreenToClient(child,&b)||!GetClientRect(child,&client)||
-               !PtInRect(&client,a)||!PtInRect(&client,b))break;
-            current=child;
-        }
-        return current;
-    }
+    // Invalidate the existing title region, including its Ribbon children.
     inline void QueueRepaint(HWND h,int reason){
         auto s=State(h); RECT band{},cr{};
         if(!s||!s->accepted||IsIconic(h)||!Band(h,band)||!GetClientRect(h,&cr))return;
         RECT header{0,0,cr.right,(std::min)(cr.bottom,band.bottom+MulDiv(6,Dpi(h),96))};
-        HWND host=PaintHost(h,band); wchar_t cls[64]{};
-        if(host)GetClassNameW(host,cls,64);
-        std::wstring name(cls);Event(13,reason,band.left,band.right,IsZoomed(h)?1:0,&name);
+        std::wstring name=L"ribbon_buffer";
+        Event(13,reason,band.left,band.right,IsZoomed(h)?1:0,&name);
         RedrawWindow(h,&header,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
-    }
-    // Called only by the already existing EndPaint callback, before presenting its DC.
-    inline void PaintInCycle(HWND owner,const PAINTSTRUCT* ps){
-        if(!ps||!ps->hdc||!owner)return;
-        HWND h=GetAncestor(owner,GA_ROOT);auto s=State(h);RECT band{};
-        if(!s||!s->accepted||IsIconic(h)||!Band(h,band)||PaintHost(h,band)!=owner)return;
-        auto api=Api();if(!api.draw)return;
-        POINT p[2]={{band.left,band.top},{band.right,band.bottom}};
-        MapWindowPoints(h,owner,p,2); RECT r{p[0].x,p[0].y,p[1].x,p[1].y};
-        RECT cr{},clip{};if(!GetClientRect(owner,&cr)||r.left<0||r.top<0||r.right>cr.right||r.bottom>cr.bottom)return;
-        if(!IntersectRect(&clip,&r,&ps->rcPaint))return;
-        int saved=SaveDC(ps->hdc);if(!saved)return;
-        IntersectClipRect(ps->hdc,r.left,r.top,r.right,r.bottom);
-        int ok=api.draw(ps->hdc,r.left,r.top,r.right,r.bottom,Dpi(h),nullptr,0,GetForegroundWindow()==h?1:0);
-        RestoreDC(ps->hdc,saved);Event(7,ok,r.right-r.left,r.bottom-r.top,0);
     }
     // Adapt upstream Ribbon transparency only for a broad fill matching the title strip.
     inline bool RibbonTitleFill(HWND ribbon,const RECT* fill){
@@ -123,6 +91,40 @@ namespace MacTrafficNative {
            fill->right<cr.right-tolerance || fill->bottom < p[1].y-tolerance ||
            fill->bottom > p[1].y+tolerance)return false;
         Event(14,fill->left,fill->top,fill->right,fill->bottom);return true;
+    }
+    // Use only the actual Ribbon memory DC already identified by the upstream code.
+    // Coordinates remain in the existing title slot. Never fill the surrounding backdrop.
+    inline void PaintRibbonBuffer(HWND ribbon,HDC dc){
+        if(!ribbon||!dc)return;
+        HWND h=GetAncestor(ribbon,GA_ROOT);auto s=State(h);RECT band{};
+        if(!s||!s->accepted||IsIconic(h)||!Band(h,band))return;
+        if(GetWindowThreadProcessId(ribbon,nullptr)!=GetCurrentThreadId()||
+           GetObjectType(dc)!=OBJ_MEMDC)return;
+        POINT p[2]={{band.left,band.top},{band.right,band.bottom}};
+        MapWindowPoints(h,ribbon,p,2);RECT r{p[0].x,p[0].y,p[1].x,p[1].y};
+        RECT cr{},clip{};
+        if(!GetClientRect(ribbon,&cr)||r.left<0||r.top<0||r.right>cr.right||r.bottom>cr.bottom){
+            Event(15,1,r.left,r.top,r.right);return;
+        }
+        const int radius=MulDiv(6,Dpi(h),96),cy=r.top+(r.bottom-r.top)/2;
+        const int left=r.right-MulDiv(70,Dpi(h),96)-radius;
+        const int right=r.right-MulDiv(26,Dpi(h),96)+radius+1;
+        const int clipType=GetClipBox(dc,&clip);
+        if(clipType==ERROR||clipType==NULLREGION||clip.left>left||clip.right<right||
+           clip.top>cy-radius||clip.bottom<cy+radius+1){
+            Event(15,2,clip.left,clip.top,clip.bottom);return;
+        }
+        auto api=Api();if(!api.draw)return;
+        // Prevent reentrancy from GDI calls used by the Rust renderer.
+        static thread_local bool drawing=false;if(drawing)return;
+        int saved=SaveDC(dc);if(!saved)return;
+        drawing=true;
+        IntersectClipRect(dc,r.left,r.top,r.right,r.bottom);
+        int ok=api.draw(dc,r.left,r.top,r.right,r.bottom,Dpi(h),nullptr,0,GetForegroundWindow()==h?1:0);
+        RestoreDC(dc,saved);drawing=false;
+        if(ok){if(auto live=State(h))live->painted=true;}
+        Event(7,ok,r.right-r.left,r.bottom-r.top,0);
+        Event(15,ok?0:3,r.left,r.top,r.right);
     }
     inline void Toggle(HWND h){
         if(State(h)){Disable(h);return;}
@@ -139,7 +141,7 @@ namespace MacTrafficNative {
            buttonsBefore.bottom>MulDiv(80,Dpi(h),96)) {Event(6,3,6,0,0);return;}
         auto s=new(std::nothrow) FrameState{style&WS_CAPTION,FALSE,false,-1,
             static_cast<int>(wr.right-wr.left-buttonsBefore.right),static_cast<int>(buttonsBefore.top),
-            static_cast<int>(buttonsBefore.right-buttonsBefore.left),static_cast<int>(buttonsBefore.bottom-buttonsBefore.top),false};
+            static_cast<int>(buttonsBefore.right-buttonsBefore.left),static_cast<int>(buttonsBefore.bottom-buttonsBefore.top),false,false};
         if(!s)return;
         // Only change the optional NC paint attribute if the previous value can be restored.
         s->restoreNcPaint=false;
@@ -179,7 +181,8 @@ namespace MacTrafficNative {
         if(FAILED(hr)||buttons.right>buttons.left){Event(6,3,7,buttons.right-buttons.left,0);Disable(h);return;}
         auto live=State(h);if(!live)return;live->accepted=true;
         Event(12,band.left,band.top,band.right,band.bottom);
-        // Repaint through the actual Explorer paint cycle; no transient GetDC pixels.
+        // One-shot safety check: restore native controls if the Ribbon paint path is absent.
+        if(!SetTimer(h,kPaintWatchdog,1200,nullptr)){Event(6,3,8,0,0);Disable(h);return;}
         RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN);
         QueueRepaint(h,1);
     }
@@ -189,6 +192,8 @@ namespace MacTrafficNative {
         auto s=State(h);if(!s)return false;
         if(msg==WM_NCDESTROY){Disable(h,true);return false;}
         switch(msg){
+        case WM_TIMER:
+            if(w==kPaintWatchdog){KillTimer(h,kPaintWatchdog);if(!s->painted){Event(6,3,9,0,0);Disable(h);}result=0;return true;}break;
         case WM_NCCALCSIZE:{
             result=DefSubclassProc(h,msg,w,l);
             // Preserve geometry, but disallow WVR_VALIDRECTS pixel-copy on resize.

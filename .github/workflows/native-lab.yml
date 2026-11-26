@@ -1,4 +1,4 @@
-name: Native Explorer Frame v0.3.7 (VM lab)
+name: Native Explorer Frame v0.3.8 (VM lab)
 on:
   workflow_dispatch:
 permissions:
@@ -32,5 +32,5 @@ jobs:
           Copy-Item COPYING.LESSER,LICENSE artifact/
       - uses: actions/upload-artifact@v4
         with:
-          name: native-explorer-v037-vm-lab
+          name: native-explorer-v038-vm-lab
           path: artifact/

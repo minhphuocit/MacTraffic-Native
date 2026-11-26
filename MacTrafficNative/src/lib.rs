@@ -4,7 +4,7 @@ use std::io::Write;
 static SEEN: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 fn describe(kind:i32,a:i32,b:i32,c:i32,d:i32,theme:&str)->String {
     match kind {
-        0 => "bridge_ready mode=frame_lab_v037".into(),
+        0 => "bridge_ready mode=frame_lab_v038".into(),
         1 => format!("config effect={a} small_border_requested={b} elapsed_ms={c} global_border_change=skipped"),
         2 => format!("blur_init effect={a} elapsed_ms={b} build={c}"),
         3 => format!("theme_candidate class={theme:?} part={a} state={b} tracked={c} path={d}"),
@@ -24,6 +24,7 @@ fn describe(kind:i32,a:i32,b:i32,c:i32,d:i32,theme:&str)->String {
         12 => format!("frame_client_slot left={a} top={b} right={c} bottom={d}"),
         13 => format!("frame_repaint reason={a} left={b} right={c} maximized={d} host={theme:?}"),
         14 => format!("frame_ribbon_title_fill left={a} top={b} right={c} bottom={d}"),
+        15 => format!("frame_ribbon_buffer result={a} left={b} top={c} detail={d}"),
         _ => String::new(),
     }
 }
@@ -37,7 +38,7 @@ fn record(kind:i32,line:String) {
     let limit=if kind==3 {64} else {48};
     if used>=limit || lines.contains(&line) {return;}
     lines.push(line.clone());
-    if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("MacTrafficNative-v037.log")) {
+    if let Ok(mut f)=std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("MacTrafficNative-v038.log")) {
         let _=writeln!(f,"pid={} {}",std::process::id(),line);
     }
 }
@@ -53,7 +54,8 @@ pub unsafe extern "system" fn mt_probe_event(kind:i32,a:i32,b:i32,c:i32,d:i32,th
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn ready(){assert_eq!(describe(0,0,0,0,0,""),"bridge_ready mode=frame_lab_v037");}
+    #[test] fn ready(){assert_eq!(describe(0,0,0,0,0,""),"bridge_ready mode=frame_lab_v038");}
+    #[test] fn ribbon_buffer_log(){assert!(describe(15,0,987,0,1133,"").contains("result=0"));}
     #[test] fn timing(){assert!(describe(2,2,123,18363,0,"").contains("elapsed_ms=123"));}
     #[test] fn names(){assert!(describe(3,18,1,0,2,"Window").contains("class=\"Window\""));}
     #[test] fn dwm(){assert!(describe(4,0x85,1,0,-1,"").contains("bounds_hr=0xffffffff"));}
