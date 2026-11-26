@@ -7,6 +7,7 @@
 */
 #include "HookDef.h"
 #include "MacTrafficBridge.h"
+#include "FrameLab034.h"
 #include "ShellLoader.h"
 #include "ComHookDef.h"
 #include <unordered_map>
@@ -347,6 +348,8 @@ namespace Hook
     LRESULT WINAPI MyWndSubProc(HWND hWnd, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
     {
         MacTrafficNative::ObserveNC(hWnd, message);
+        LRESULT mtFrameResult=0;
+        if(g_sysBuildNumber==18363 && MacTrafficNative::HandleFrame(hWnd,message,wparam,lparam,mtFrameResult)) return mtFrameResult;
         if (dwRefData == 0)
         {
             switch (message)
@@ -605,6 +608,9 @@ namespace Hook
             }
             else
                 SetWindowSubclass(mainWnd, MyWndSubProc, 0, (DWORD_PTR)3);
+
+            // Opt-in menu, restricted to the tested Windows 10 build.
+            if(g_sysBuildNumber==18363) MacTrafficNative::EnsureMenu(mainWnd);
 
             //记录到列表中 Add to list
             DWORD tid = GetCurrentThreadId();

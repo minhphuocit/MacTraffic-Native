@@ -1,4 +1,4 @@
-name: Native caption lab v0.3.1 (probe only)
+name: Native Explorer Frame v0.3.4 (VM lab)
 on:
   workflow_dispatch:
 permissions:
@@ -9,15 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
-      - name: Build and test Rust probe
+      - name: Build and test Rust renderer
         shell: pwsh
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
-          cargo +stable-x86_64-pc-windows-gnu test --manifest-path MacTrafficNative/Cargo.toml --target x86_64-pc-windows-gnu
+          cargo +stable-x86_64-pc-windows-gnu test --locked --manifest-path MacTrafficNative/Cargo.toml --target x86_64-pc-windows-gnu
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo +stable-x86_64-pc-windows-gnu build --manifest-path MacTrafficNative/Cargo.toml --release --target x86_64-pc-windows-gnu
+          cargo +stable-x86_64-pc-windows-gnu build --locked --manifest-path MacTrafficNative/Cargo.toml --release --target x86_64-pc-windows-gnu
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build the upstream extension with the source probe
+      - name: Build the Explorer integration
         shell: pwsh
         run: |
           msbuild ExplorerBlurMica.sln /m /p:Configuration=Release /p:Platform=x64
@@ -26,8 +26,11 @@ jobs:
           Copy-Item build/x64/Release/ExplorerBlurMica.dll artifact/
           Copy-Item MacTrafficNative/target/x86_64-pc-windows-gnu/release/mactraffic_caption.dll artifact/
           Copy-Item build/x64/Release/config.ini artifact/
+          $cfg = Get-Content artifact/config.ini -Raw
+          $cfg = $cfg -replace '(?m)^effect=\d+', 'effect=2'
+          [IO.File]::WriteAllText((Join-Path $PWD 'artifact/config.ini'), $cfg, (New-Object Text.UTF8Encoding($false)))
           Copy-Item COPYING.LESSER,LICENSE artifact/
       - uses: actions/upload-artifact@v4
         with:
-          name: native-lab-v031-probe-only
+          name: native-explorer-v034-vm-lab
           path: artifact/

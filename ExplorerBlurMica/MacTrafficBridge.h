@@ -1,5 +1,5 @@
 #pragma once
-// Probe only: reuse upstream callbacks. No paint, new hooks or window mutation.
+// Reuse upstream callbacks. Native frame is opt-in per Explorer window.
 #include <windows.h>
 #include <dwmapi.h>
 #include <string>
@@ -7,8 +7,8 @@
 extern HMODULE g_hModule;
 namespace MacTrafficNative {
     using Logger = void (WINAPI*)(int,int,int,int,int,const wchar_t*,unsigned int);
-    inline Logger GetLogger() {
-        static Logger logger = []() -> Logger {
+    inline HMODULE BridgeModule() {
+        static HMODULE module = []() -> HMODULE {
             wchar_t path[32768]{};
             DWORD n=GetModuleFileNameW(g_hModule,path,32768);
             if (!n || n>=32768) return nullptr;
@@ -16,7 +16,13 @@ namespace MacTrafficNative {
             auto pos=file.find_last_of(L"\\/");
             if(pos==std::wstring::npos) return nullptr;
             file.resize(pos+1); file+=L"mactraffic_caption.dll";
-            HMODULE module=LoadLibraryExW(file.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+            return LoadLibraryExW(file.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }();
+        return module;
+    }
+    inline Logger GetLogger() {
+        static Logger logger=[]() -> Logger {
+            HMODULE module=BridgeModule();
             if(!module) return nullptr;
             auto fn=reinterpret_cast<Logger>(GetProcAddress(module,"mt_probe_event"));
             if(fn) fn(0,0,0,0,0,nullptr,0);
