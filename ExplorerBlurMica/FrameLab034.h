@@ -1,10 +1,11 @@
 #pragma once
-// Experimental opt-in extra caption band for the existing Explorer subclass, Win10 18363 only.
+// Experimental opt-in existing caption slot for the existing Explorer subclass, Win10 18363 only.
 // No extra hooks, no desktop capture or separate top-level window.
 #include <commctrl.h>
 #include <new>
 #include <cwchar>
 #include <cstdlib>
+#include <algorithm>
 namespace MacTrafficNative {
     using FrameHit = int (WINAPI*)(int,int,int,int,int,int,unsigned);
     using FrameDraw = int (WINAPI*)(HDC,int,int,int,int,unsigned,const wchar_t*,unsigned,int);
@@ -18,8 +19,8 @@ namespace MacTrafficNative {
         return api;
     }
     constexpr UINT kToggle=0x1e30;
-    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab035.State";
-    struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; };
+    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab036.State";
+    struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; int rightInset; int slotTop; int slotWidth; int slotHeight; bool accepted; };
     inline FrameState* State(HWND h) {return reinterpret_cast<FrameState*>(GetPropW(h,kProp));}
     inline bool Eligible(HWND h) {
         wchar_t cls[64]{};
@@ -28,19 +29,21 @@ namespace MacTrafficNative {
     }
     inline UINT Dpi(HWND h){UINT d=GetDpiForWindow(h);return d?d:96;}
     inline int CaptionHeight(HWND h){return GetSystemMetricsForDpi(SM_CYCAPTION,Dpi(h));}
+    // Map the original DWM button slot into the current client coordinates.
     inline bool Band(HWND h,RECT& band) {
-        RECT wr{},cr{};POINT origin{};
-        if(!GetWindowRect(h,&wr)||!GetClientRect(h,&cr)||!ClientToScreen(h,&origin))return false;
-        const int top=origin.y-wr.top;
-        const int extra=CaptionHeight(h);
-        if(extra<=0||top<extra)return false;
-        band={origin.x-wr.left,top-extra,origin.x-wr.left+cr.right,top};
-        return band.right-band.left>MulDiv(160,Dpi(h),96);
+        auto s=State(h);RECT wr{},cr{};POINT origin{};
+        if(!s||!GetWindowRect(h,&wr)||!GetClientRect(h,&cr)||!ClientToScreen(h,&origin))return false;
+        int right=wr.right-s->rightInset-origin.x;
+        int top=wr.top+s->slotTop-origin.y;
+        band={right-s->slotWidth,(std::max)(0,top),right,top+s->slotHeight};
+        band.left=(std::max)(0L,band.left);band.right=(std::min)(cr.right,band.right);
+        band.bottom=(std::min)(cr.bottom,band.bottom);
+        return band.right-band.left>=MulDiv(94,Dpi(h),96)&&band.bottom-band.top>=MulDiv(12,Dpi(h),96);
     }
     inline int RoleAt(HWND h,POINT pt){
-        RECT wr{},r{};auto api=Api();
-        if(!api.hit||!GetWindowRect(h,&wr)||!Band(h,r))return -1;
-        return api.hit(pt.x-wr.left,pt.y-wr.top,r.left,r.top,r.right,r.bottom,Dpi(h));
+        RECT r{};auto api=Api();auto s=State(h);
+        if(!s||!s->accepted||!api.hit||!ScreenToClient(h,&pt)||!Band(h,r))return -1;
+        return api.hit(pt.x,pt.y,r.left,r.top,r.right,r.bottom,Dpi(h));
     }
     inline POINT ScreenPoint(LPARAM l){return POINT{static_cast<short>(LOWORD(l)),static_cast<short>(HIWORD(l))};}
     inline void Refresh(HWND h){
@@ -52,7 +55,7 @@ namespace MacTrafficNative {
         HMENU menu=GetSystemMenu(h,FALSE);
         if(menu&&GetMenuState(menu,kToggle,MF_BYCOMMAND)==static_cast<UINT>(-1)){
             AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-            if(AppendMenuW(menu,MF_STRING,kToggle,L"MacTraffic: Toggle test caption band")) Event(6,0,0,0,0);
+            if(AppendMenuW(menu,MF_STRING,kToggle,L"MacTraffic: Toggle test caption")) Event(6,0,0,0,0);
         }
     }
     inline void Disable(HWND h,bool destroying=false){
@@ -63,8 +66,9 @@ namespace MacTrafficNative {
         if(GetCapture()==h)ReleaseCapture();
         SetWindowLongPtrW(h,GWL_STYLE,(GetWindowLongPtrW(h,GWL_STYLE)&~static_cast<LONG_PTR>(WS_CAPTION))|caption);
         if(restore)DwmSetWindowAttribute(h,DWMWA_ALLOW_NCPAINT,&old,sizeof(old));
-        Refresh(h);EnsureMenu(h);Event(6,2,0,0,0);
+        Refresh(h);EnsureMenu(h);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);Event(6,2,0,0,0);
     }
+    inline void Paint(HWND h);
     inline void Toggle(HWND h){
         if(State(h)){Disable(h);return;}
         if(!Eligible(h)||IsIconic(h)||IsZoomed(h)||!Api().draw||!Api().hit){Event(6,3,1,0,0);return;}
@@ -72,10 +76,18 @@ namespace MacTrafficNative {
         if((style&WS_CAPTION)!=WS_CAPTION){Event(6,3,2,0,0);return;}
         RECT wr{},oldClient{};POINT oldOrigin{};
         if(!GetWindowRect(h,&wr)||!GetClientRect(h,&oldClient)||!ClientToScreen(h,&oldOrigin))return;
-        auto s=new(std::nothrow) FrameState{style&WS_CAPTION,FALSE,false,-1};
+        RECT buttonsBefore{};
+        if(FAILED(DwmGetWindowAttribute(h,DWMWA_CAPTION_BUTTON_BOUNDS,&buttonsBefore,sizeof(buttonsBefore)))||
+           buttonsBefore.right-buttonsBefore.left<MulDiv(94,Dpi(h),96)||
+           buttonsBefore.bottom-buttonsBefore.top<MulDiv(12,Dpi(h),96)||
+           buttonsBefore.left<0||buttonsBefore.top<0||buttonsBefore.right>wr.right-wr.left||
+           buttonsBefore.bottom>MulDiv(80,Dpi(h),96)) {Event(6,3,6,0,0);return;}
+        auto s=new(std::nothrow) FrameState{style&WS_CAPTION,FALSE,false,-1,
+            static_cast<int>(wr.right-wr.left-buttonsBefore.right),static_cast<int>(buttonsBefore.top),
+            static_cast<int>(buttonsBefore.right-buttonsBefore.left),static_cast<int>(buttonsBefore.bottom-buttonsBefore.top),false};
         if(!s)return;
         // Only change the optional NC paint attribute if the previous value can be restored.
-        s->restoreNcPaint=SUCCEEDED(DwmGetWindowAttribute(h,DWMWA_ALLOW_NCPAINT,&s->oldNcPaint,sizeof(BOOL)));
+        s->restoreNcPaint=false;
         if(!SetPropW(h,kProp,s)){delete s;return;}
         if(s->restoreNcPaint){BOOL yes=TRUE;DwmSetWindowAttribute(h,DWMWA_ALLOW_NCPAINT,&yes,sizeof(yes));}
         SetLastError(0);
@@ -87,10 +99,9 @@ namespace MacTrafficNative {
         if(!ClientToScreen(h,&newOrigin)||!GetWindowRect(h,&newWr)||!GetClientRect(h,&newClient)||!Band(h,band)){
             Event(6,3,4,0,0);Disable(h);return;
         }
-        // The experiment intentionally reserves one extra caption band. Do not
-        // reject that expected inset, but reject unrelated layout changes.
+        // No additional caption band: preserve existing client geometry.
         const int before=oldOrigin.y-wr.top,after=newOrigin.y-newWr.top;
-        const int delta=after-before, extra=CaptionHeight(h);
+        const int delta=after-before, extra=0;
         const int tol=MulDiv(4,Dpi(h),96);
         const int dx=(newOrigin.x-newWr.left)-(oldOrigin.x-wr.left);
         const int dw=newClient.right-oldClient.right;
@@ -98,9 +109,8 @@ namespace MacTrafficNative {
         const int bottomDelta=delta+dh;
         Event(6,1,before,after,band.bottom-band.top);
         Event(10,delta,dx,dw,dh);
-        // On this build, the old Explorer frame already extended to y=0.
-        // Allow only the expected caption-height shift, with a small frame tolerance.
-        if(extra<=0 || std::abs(delta-extra)>tol || std::abs(dx)>tol ||
+        // Reject client displacement beyond the existing frame tolerance.
+        if(std::abs(delta)>tol || std::abs(dx)>tol ||
            std::abs(dw)>2*tol || std::abs(bottomDelta)>tol ||
            std::abs((newWr.right-newWr.left)-(wr.right-wr.left))>tol ||
            std::abs((newWr.bottom-newWr.top)-(wr.bottom-wr.top))>tol ||
@@ -111,17 +121,21 @@ namespace MacTrafficNative {
         RECT buttons{};HRESULT hr=DwmGetWindowAttribute(h,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons));
         Event(9,static_cast<int>(hr),buttons.right-buttons.left,buttons.bottom-buttons.top,
             (GetWindowLongPtrW(h,GWL_STYLE)&WS_CAPTION)==WS_CAPTION?1:0);
-        RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOCHILDREN|RDW_UPDATENOW);
+        if(FAILED(hr)||buttons.right>buttons.left){Event(6,3,7,buttons.right-buttons.left,0);Disable(h);return;}
+        auto live=State(h);if(!live)return;live->accepted=true;
+        Event(12,band.left,band.top,band.right,band.bottom);
+        // Full client redraw removes stale copies of the old title row.
+        RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);
+        if(State(h))Paint(h);
     }
     inline void Paint(HWND h){
-        RECT r{};auto api=Api();if(!api.draw||!Band(h,r))return;
-        HDC dc=GetWindowDC(h);if(!dc)return;
-        wchar_t title[256]{};int len=GetWindowTextW(h,title,256);
+        RECT r{};auto api=Api();auto s=State(h);if(!s||!s->accepted||!api.draw||IsIconic(h)||!Band(h,r))return;
+        HDC dc=GetDC(h);if(!dc)return;
         const int saved=SaveDC(dc);
         int ok=0;
         if(saved){
             IntersectClipRect(dc,r.left,r.top,r.right,r.bottom);
-            ok=api.draw(dc,r.left,r.top,r.right,r.bottom,Dpi(h),title,len>0?static_cast<unsigned>(len):0,GetForegroundWindow()==h?1:0);
+            ok=api.draw(dc,r.left,r.top,r.right,r.bottom,Dpi(h),nullptr,0,GetForegroundWindow()==h?1:0);
             RestoreDC(dc,saved);
         }
         ReleaseDC(h,dc);Event(7,ok,r.right-r.left,r.bottom-r.top,0);
@@ -134,11 +148,10 @@ namespace MacTrafficNative {
         switch(msg){
         case WM_NCCALCSIZE:{
             result=DefSubclassProc(h,msg,w,l);
-            if(l){RECT* r=w?&reinterpret_cast<NCCALCSIZE_PARAMS*>(l)->rgrc[0]:reinterpret_cast<RECT*>(l);
-                const int extra=CaptionHeight(h);if(r->bottom-r->top>extra)r->top+=extra;}
-            result=0;return true;
+            // Do not reserve an extra row or change Explorer's computed rectangle.
+            return true;
         }
-        case WM_NCPAINT:
+        case WM_NCPAINT:case WM_PAINT:
             result=DefSubclassProc(h,msg,w,l);if(State(h))Paint(h);return true;
         case WM_NCACTIVATE:
             result=DefSubclassProc(h,msg,w,l);if(State(h))RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOCHILDREN);return true;
@@ -148,24 +161,20 @@ namespace MacTrafficNative {
             result=DefSubclassProc(h,msg,w,l);
             // Keep the OS resize edges and the rest of Explorer's hit testing.
             if(result>=HTLEFT&&result<=HTBOTTOMRIGHT)return true;
-            POINT p=ScreenPoint(l);RECT wr{},r{};
-            if(GetWindowRect(h,&wr)&&Band(h,r)){
-                POINT q{p.x-wr.left,p.y-wr.top};
-                if(PtInRect(&r,q))result=RoleAt(h,p)>=0?HTBORDER:HTCAPTION;
-            }
+            if(RoleAt(h,ScreenPoint(l))>=0)result=HTBORDER;
             return true;
         }
-        case WM_NCLBUTTONDOWN:
-            {int role=RoleAt(h,ScreenPoint(l));if(role>=0){
+        case WM_LBUTTONDOWN:case WM_NCLBUTTONDOWN:
+            {POINT p=ScreenPoint(l);if(msg==WM_LBUTTONDOWN&&!ClientToScreen(h,&p))break;int role=RoleAt(h,p);if(role>=0){
                 s->pressed=role;SetCapture(h);result=0;return true;
             }}break;
         case WM_NCRBUTTONUP:{
-            POINT p=ScreenPoint(l);RECT wr{},r{};
-            if(GetWindowRect(h,&wr)&&Band(h,r)){POINT q{p.x-wr.left,p.y-wr.top};if(PtInRect(&r,q)){Disable(h);result=0;return true;}}
+            if(RoleAt(h,ScreenPoint(l))>=0){Disable(h);result=0;return true;}
             break;
         }
-        case WM_NCLBUTTONDBLCLK:
-            if(RoleAt(h,ScreenPoint(l))>=0){result=0;return true;}break;
+        case WM_LBUTTONDBLCLK:case WM_NCLBUTTONDBLCLK:{
+            POINT p=ScreenPoint(l);if(msg==WM_LBUTTONDBLCLK&&!ClientToScreen(h,&p))break;
+            if(RoleAt(h,p)>=0){result=0;return true;}break;}
         case WM_LBUTTONUP:case WM_NCLBUTTONUP:
             if(s->pressed>=0){
                 int role=s->pressed;s->pressed=-1;POINT p{};bool clicked=GetCursorPos(&p)&&RoleAt(h,p)==role;
