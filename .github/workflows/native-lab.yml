@@ -1,11 +1,6 @@
-name: Native caption lab (build only)
+name: Native caption lab v0.3.1 (probe only)
 on:
   workflow_dispatch:
-    inputs:
-      paint:
-        description: 'Experimental paint (VM only); false = read-only probe'
-        type: boolean
-        default: false
 permissions:
   contents: read
 jobs:
@@ -14,17 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
-      - name: Build and test Rust renderer
+      - name: Build and test Rust probe
         shell: pwsh
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
           cargo +stable-x86_64-pc-windows-gnu test --manifest-path MacTrafficNative/Cargo.toml --target x86_64-pc-windows-gnu
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $features = @()
-          if ('${{ inputs.paint }}' -eq 'true') { $features = @('--features','paint') }
-          cargo +stable-x86_64-pc-windows-gnu build --manifest-path MacTrafficNative/Cargo.toml --release --target x86_64-pc-windows-gnu @features
+          cargo +stable-x86_64-pc-windows-gnu build --manifest-path MacTrafficNative/Cargo.toml --release --target x86_64-pc-windows-gnu
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build the upstream extension with the source bridge
+      - name: Build the upstream extension with the source probe
         shell: pwsh
         run: |
           msbuild ExplorerBlurMica.sln /m /p:Configuration=Release /p:Platform=x64
@@ -36,5 +29,5 @@ jobs:
           Copy-Item COPYING.LESSER,LICENSE artifact/
       - uses: actions/upload-artifact@v4
         with:
-          name: native-lab-build-only
+          name: native-lab-v031-probe-only
           path: artifact/

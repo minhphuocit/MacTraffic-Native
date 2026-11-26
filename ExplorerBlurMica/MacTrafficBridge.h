@@ -1,43 +1,54 @@
 #pragma once
-// Source-level integration with ExplorerBlurMica 1.0.7 only.
-// The upstream project retains ownership of windows and of all original hooks.
+// Probe only: reuse upstream callbacks. No paint, new hooks or window mutation.
 #include <windows.h>
+#include <dwmapi.h>
 #include <string>
+#include <atomic>
 extern HMODULE g_hModule;
 namespace MacTrafficNative {
-    using Painter = int (WINAPI*)(HDC,int,int,RECT,UINT,int,int);
-    inline Painter GetPainter() {
-        // Same directory as the explicitly installed upstream test extension.
-        // Do not search PATH or the current working directory.
-        static Painter proc = []() -> Painter {
+    using Logger = void (WINAPI*)(int,int,int,int,int,const wchar_t*,unsigned int);
+    inline Logger GetLogger() {
+        static Logger logger = []() -> Logger {
             wchar_t path[32768]{};
-            DWORD n = GetModuleFileNameW(g_hModule,path,32768);
-            if (!n || n >= 32768) return nullptr;
+            DWORD n=GetModuleFileNameW(g_hModule,path,32768);
+            if (!n || n>=32768) return nullptr;
             std::wstring file(path,n);
             auto pos=file.find_last_of(L"\\/");
-            if (pos==std::wstring::npos) return nullptr;
+            if(pos==std::wstring::npos) return nullptr;
             file.resize(pos+1); file+=L"mactraffic_caption.dll";
             HMODULE module=LoadLibraryExW(file.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
-            if (!module) return nullptr;
-            auto proc=reinterpret_cast<Painter>(GetProcAddress(module,"mt_caption_draw"));
-            if (proc) {
-                using Start=void (WINAPI*)();
-                auto start=reinterpret_cast<Start>(GetProcAddress(module,"mt_caption_probe_start"));
-                if(start) start();
-            }
-            return proc;
+            if(!module) return nullptr;
+            auto fn=reinterpret_cast<Logger>(GetProcAddress(module,"mt_probe_event"));
+            if(fn) fn(0,0,0,0,0,nullptr,0);
+            return fn;
         }();
-        return proc;
+        return logger;
     }
-    inline bool TryPaint(const std::wstring& theme,HDC dc,int part,int state,LPCRECT r,HWND mainWnd,bool clipOk) {
-        if (!r || !mainWnd || !dc) return false;
-        wchar_t cls[64]{};
-        if (!GetClassNameW(mainWnd,cls,64) || wcscmp(cls,L"CabinetWClass")!=0) return false;
-        auto paint=GetPainter(); if (!paint) return false;
-        if (_wcsicmp(theme.c_str(),L"Window") != 0 || (part!=15 && part!=17 && part!=18 && part!=21)) return false;
-        return paint(dc,part,state,*r,GetDpiForWindow(mainWnd),WindowFromDC(dc)==mainWnd,clipOk?1:0)==1;
+    inline void Event(int kind,int a,int b,int c,int d,const std::wstring* name=nullptr) {
+        if(auto fn=GetLogger()) fn(kind,a,b,c,d,name?name->c_str():nullptr,name?static_cast<unsigned int>(name->size()):0);
     }
-    inline bool Contains(LPCRECT outer,LPCRECT inner) {
-        return !outer || (inner && outer->left<=inner->left && outer->top<=inner->top && outer->right>=inner->right && outer->bottom>=inner->bottom);
+    inline bool Candidate(int part) {return part==15||part==17||part==18||part==21;}
+    inline void ObserveTheme(const std::wstring& theme,int part,int state,bool tracked,int path) {
+        if(!Candidate(part)) return;
+        // Theme part identifiers are only meaningful together with their class.
+        if (!tracked && theme.find(L"Window")==std::wstring::npos && theme.find(L"WINDOW")==std::wstring::npos && theme.find(L"window")==std::wstring::npos && !theme.empty()) return;
+        Event(3,part,state,tracked?1:0,path,&theme);
+    }
+    inline void ObserveNC(HWND hwnd,UINT msg) {
+        unsigned bit=0;
+        switch(msg) {
+            case WM_NCCALCSIZE: bit=1; break;
+            case WM_NCPAINT: bit=2; break;
+            case WM_NCACTIVATE: bit=4; break;
+            case WM_NCHITTEST: bit=8; break;
+            default:return;
+        }
+        static std::atomic<unsigned> seen{0};
+        if(seen.fetch_or(bit,std::memory_order_relaxed)&bit) return;
+        BOOL enabled=FALSE; RECT bounds{};
+        HRESULT e=DwmGetWindowAttribute(hwnd,DWMWA_NCRENDERING_ENABLED,&enabled,sizeof(enabled));
+        HRESULT b=DwmGetWindowAttribute(hwnd,DWMWA_CAPTION_BUTTON_BOUNDS,&bounds,sizeof(bounds));
+        Event(4,static_cast<int>(msg),SUCCEEDED(e)?static_cast<int>(enabled):-1,static_cast<int>(e),static_cast<int>(b));
+        if(SUCCEEDED(b)) Event(5,static_cast<int>(msg),bounds.right-bounds.left,bounds.bottom-bounds.top,0);
     }
 }

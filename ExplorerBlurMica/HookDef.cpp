@@ -137,6 +137,7 @@ COLORREF GetColorCfg(bool light)
 
 void RefreshConfig()
 {
+    const ULONGLONG mtStarted = GetTickCount64();
     std::wstring path = GetCurDllDir() + L"\\config.ini";
     auto cfg = GetIniString(path, L"config", L"effect");
 
@@ -156,7 +157,8 @@ void RefreshConfig()
     m_config.clearAddress = GetIniString(path, L"config", L"clearAddress") == L"true" ? true : false;
     m_config.clearBarBg = GetIniString(path, L"config", L"clearBarBg") == L"true" ? true : false;
 
-    RefreshWin10BlurFrame(m_config.smallborder);
+    // Native lab: preserve current system border metrics; no global registry or wait.
+    MacTrafficNative::Event(1, m_config.effType, m_config.smallborder ? 1 : 0, static_cast<int>(GetTickCount64()-mtStarted), 0);
 }
 
 void OnDocComplete(std::wstring path, DWORD threadID)
@@ -344,6 +346,7 @@ namespace Hook
     //窗口子类化
     LRESULT WINAPI MyWndSubProc(HWND hWnd, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
     {
+        MacTrafficNative::ObserveNC(hWnd, message);
         if (dwRefData == 0)
         {
             switch (message)
@@ -586,7 +589,9 @@ namespace Hook
         {
             HWND mainWnd = GetParent(hWndParent);
             //设置Blur
+            const ULONGLONG mtBlurStarted = GetTickCount64();
             SetWindowBlur(mainWnd);
+            MacTrafficNative::Event(2, m_config.effType, static_cast<int>(GetTickCount64()-mtBlurStarted), g_sysBuildNumber, 0);
 
             //22H2
             if (g_sysBuildNumber >= 22500)
@@ -1174,12 +1179,13 @@ namespace Hook
         LPCRECT pRect,
         LPCRECT pClipRect)
     {
-        if (!IsExcludePath())
+        const bool tracked = !IsExcludePath();
+        // Also observe possible caption parts before Explorer registers its thread.
+        std::wstring kname;
+        if (tracked || MacTrafficNative::Candidate(iPartId)) kname = GetThemeClassName(hTheme);
+        MacTrafficNative::ObserveTheme(kname, iPartId, iStateId, tracked, 1);
+        if (tracked)
         {
-            std::wstring kname = GetThemeClassName(hTheme);
-
-            auto mt = m_DUIList.find(GetCurrentThreadId());
-            if (mt != m_DUIList.end() && MacTrafficNative::TryPaint(kname, hdc, iPartId, iStateId, pRect, mt->second.mainWnd, MacTrafficNative::Contains(pClipRect,pRect))) return S_OK;
 
             //td::wcout << kname << L" p:" << iPartId << L" s:" << iStateId << std::endl;
 
@@ -1212,12 +1218,12 @@ namespace Hook
     )
     {
     	std::wstring kname = GetThemeClassName(hTheme);
-        if (!IsExcludePath())
+        const bool tracked = !IsExcludePath();
+        MacTrafficNative::ObserveTheme(kname, iPartId, iStateId, tracked, 2);
+        if (tracked)
         {
 
-                        auto mt = m_DUIList.find(GetCurrentThreadId());
-            if (mt != m_DUIList.end() && MacTrafficNative::TryPaint(kname, hdc, iPartId, iStateId, pRect, mt->second.mainWnd, !pOptions || pOptions->dwFlags == 0)) return S_OK;
-//std::wcout << kname << L" p:" << iPartId << L" s:" << iStateId << std::endl;
+            //std::wcout << kname << L" p:" << iPartId << L" s:" << iStateId << std::endl;
 
             //Blur模式下 透明化 Header、Rebar、预览面板、命令模块
             if (kname == L"Header") {
