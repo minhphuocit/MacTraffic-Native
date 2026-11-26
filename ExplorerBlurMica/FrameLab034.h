@@ -19,7 +19,7 @@ namespace MacTrafficNative {
         return api;
     }
     constexpr UINT kToggle=0x1e30;
-    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab036.State";
+    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab037.State";
     struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; int rightInset; int slotTop; int slotWidth; int slotHeight; bool accepted; };
     inline FrameState* State(HWND h) {return reinterpret_cast<FrameState*>(GetPropW(h,kProp));}
     inline bool Eligible(HWND h) {
@@ -68,7 +68,62 @@ namespace MacTrafficNative {
         if(restore)DwmSetWindowAttribute(h,DWMWA_ALLOW_NCPAINT,&old,sizeof(old));
         Refresh(h);EnsureMenu(h);RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);Event(6,2,0,0,0);
     }
-    inline void Paint(HWND h);
+    // Select one actual client paint owner; never paint through a borrowed GetDC.
+    inline HWND PaintHost(HWND h, const RECT& band) {
+        POINT corners[2]={{band.left,band.top},{band.right-1,band.bottom-1}};
+        if(!ClientToScreen(h,&corners[0])||!ClientToScreen(h,&corners[1]))return nullptr;
+        POINT pt{band.right-MulDiv(26,Dpi(h),96), (band.top+band.bottom)/2};
+        if(!ClientToScreen(h,&pt))return nullptr;
+        HWND current=h;
+        for(int i=0;i<12;++i){
+            POINT local=pt; if(!ScreenToClient(current,&local))return nullptr;
+            HWND child=ChildWindowFromPointEx(current,local,CWP_SKIPINVISIBLE|CWP_SKIPTRANSPARENT);
+            if(!child||child==current)break;
+            if(GetWindowThreadProcessId(child,nullptr)!=GetCurrentThreadId())return nullptr;
+            POINT a=corners[0],b=corners[1];RECT client{};
+            if(!ScreenToClient(child,&a)||!ScreenToClient(child,&b)||!GetClientRect(child,&client)||
+               !PtInRect(&client,a)||!PtInRect(&client,b))break;
+            current=child;
+        }
+        return current;
+    }
+    inline void QueueRepaint(HWND h,int reason){
+        auto s=State(h); RECT band{},cr{};
+        if(!s||!s->accepted||IsIconic(h)||!Band(h,band)||!GetClientRect(h,&cr))return;
+        RECT header{0,0,cr.right,(std::min)(cr.bottom,band.bottom+MulDiv(6,Dpi(h),96))};
+        HWND host=PaintHost(h,band); wchar_t cls[64]{};
+        if(host)GetClassNameW(host,cls,64);
+        std::wstring name(cls);Event(13,reason,band.left,band.right,IsZoomed(h)?1:0,&name);
+        RedrawWindow(h,&header,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
+    }
+    // Called only by the already existing EndPaint callback, before presenting its DC.
+    inline void PaintInCycle(HWND owner,const PAINTSTRUCT* ps){
+        if(!ps||!ps->hdc||!owner)return;
+        HWND h=GetAncestor(owner,GA_ROOT);auto s=State(h);RECT band{};
+        if(!s||!s->accepted||IsIconic(h)||!Band(h,band)||PaintHost(h,band)!=owner)return;
+        auto api=Api();if(!api.draw)return;
+        POINT p[2]={{band.left,band.top},{band.right,band.bottom}};
+        MapWindowPoints(h,owner,p,2); RECT r{p[0].x,p[0].y,p[1].x,p[1].y};
+        RECT cr{},clip{};if(!GetClientRect(owner,&cr)||r.left<0||r.top<0||r.right>cr.right||r.bottom>cr.bottom)return;
+        if(!IntersectRect(&clip,&r,&ps->rcPaint))return;
+        int saved=SaveDC(ps->hdc);if(!saved)return;
+        IntersectClipRect(ps->hdc,r.left,r.top,r.right,r.bottom);
+        int ok=api.draw(ps->hdc,r.left,r.top,r.right,r.bottom,Dpi(h),nullptr,0,GetForegroundWindow()==h?1:0);
+        RestoreDC(ps->hdc,saved);Event(7,ok,r.right-r.left,r.bottom-r.top,0);
+    }
+    // Adapt upstream Ribbon transparency only for a broad fill matching the title strip.
+    inline bool RibbonTitleFill(HWND ribbon,const RECT* fill){
+        if(!ribbon||!fill)return false;
+        HWND h=GetAncestor(ribbon,GA_ROOT);auto s=State(h);RECT band{},cr{};
+        if(!s||!s->accepted||!Band(h,band)||!GetClientRect(ribbon,&cr))return false;
+        POINT p[2]={{0,band.top},{band.right,band.bottom}};MapWindowPoints(h,ribbon,p,2);
+        const int tolerance=MulDiv(8,Dpi(h),96);
+        if(p[0].y < -tolerance || p[0].y > tolerance || p[1].y<=0)return false;
+        if(fill->left>tolerance || fill->top>tolerance || fill->top< -tolerance ||
+           fill->right<cr.right-tolerance || fill->bottom < p[1].y-tolerance ||
+           fill->bottom > p[1].y+tolerance)return false;
+        Event(14,fill->left,fill->top,fill->right,fill->bottom);return true;
+    }
     inline void Toggle(HWND h){
         if(State(h)){Disable(h);return;}
         if(!Eligible(h)||IsIconic(h)||IsZoomed(h)||!Api().draw||!Api().hit){Event(6,3,1,0,0);return;}
@@ -124,21 +179,9 @@ namespace MacTrafficNative {
         if(FAILED(hr)||buttons.right>buttons.left){Event(6,3,7,buttons.right-buttons.left,0);Disable(h);return;}
         auto live=State(h);if(!live)return;live->accepted=true;
         Event(12,band.left,band.top,band.right,band.bottom);
-        // Full client redraw removes stale copies of the old title row.
-        RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);
-        if(State(h))Paint(h);
-    }
-    inline void Paint(HWND h){
-        RECT r{};auto api=Api();auto s=State(h);if(!s||!s->accepted||!api.draw||IsIconic(h)||!Band(h,r))return;
-        HDC dc=GetDC(h);if(!dc)return;
-        const int saved=SaveDC(dc);
-        int ok=0;
-        if(saved){
-            IntersectClipRect(dc,r.left,r.top,r.right,r.bottom);
-            ok=api.draw(dc,r.left,r.top,r.right,r.bottom,Dpi(h),nullptr,0,GetForegroundWindow()==h?1:0);
-            RestoreDC(dc,saved);
-        }
-        ReleaseDC(h,dc);Event(7,ok,r.right-r.left,r.bottom-r.top,0);
+        // Repaint through the actual Explorer paint cycle; no transient GetDC pixels.
+        RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_ALLCHILDREN);
+        QueueRepaint(h,1);
     }
     // True means the existing subclass has already forwarded/handled the message.
     inline bool HandleFrame(HWND h,UINT msg,WPARAM w,LPARAM l,LRESULT& result){
@@ -148,15 +191,19 @@ namespace MacTrafficNative {
         switch(msg){
         case WM_NCCALCSIZE:{
             result=DefSubclassProc(h,msg,w,l);
-            // Do not reserve an extra row or change Explorer's computed rectangle.
+            // Preserve geometry, but disallow WVR_VALIDRECTS pixel-copy on resize.
+            if(w && State(h) && State(h)->accepted)result=WVR_REDRAW;
             return true;
         }
-        case WM_NCPAINT:case WM_PAINT:
-            result=DefSubclassProc(h,msg,w,l);if(State(h))Paint(h);return true;
+        case WM_WINDOWPOSCHANGING:
+            if(s->accepted&&l){auto pos=reinterpret_cast<WINDOWPOS*>(l);if(!(pos->flags&SWP_NOSIZE))pos->flags|=SWP_NOCOPYBITS;}
+            break;
+        case WM_SIZE:
+            result=DefSubclassProc(h,msg,w,l);if(w!=SIZE_MINIMIZED)QueueRepaint(h,2);return true;
         case WM_NCACTIVATE:
-            result=DefSubclassProc(h,msg,w,l);if(State(h))RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOCHILDREN);return true;
+            result=DefSubclassProc(h,msg,w,l);QueueRepaint(h,3);return true;
         case WM_SETTEXT:
-            result=DefSubclassProc(h,msg,w,l);if(State(h))RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOCHILDREN);return true;
+            result=DefSubclassProc(h,msg,w,l);QueueRepaint(h,4);return true;
         case WM_NCHITTEST:{
             result=DefSubclassProc(h,msg,w,l);
             // Keep the OS resize edges and the rest of Explorer's hit testing.

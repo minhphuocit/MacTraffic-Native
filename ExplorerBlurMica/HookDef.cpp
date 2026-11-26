@@ -424,6 +424,7 @@ namespace Hook
                     rc.right += width;
                 }
                 DwmUpdateAccentBlurRect(hWnd, &rc);
+                if (g_sysBuildNumber==18363 && !(pos->flags&SWP_NOSIZE)) MacTrafficNative::QueueRepaint(hWnd,5);
 
                 return ret;
             }
@@ -733,6 +734,7 @@ namespace Hook
             }
         }
 
+        if (g_sysBuildNumber==18363) MacTrafficNative::PaintInCycle(hWnd, lpPaint);
         auto ribiter = m_ribbonPaint.find(curThread);
         if (ribiter != m_ribbonPaint.end())
             m_ribbonPaint.erase(ribiter);
@@ -790,7 +792,8 @@ namespace Hook
                 RECT rcWnd;
                 GetWindowRect(ribiter->second.first, &rcWnd);
 
-                if (lprc->bottom == CalcRibbonHeightForDPI(ribiter->second.first, 26, false)
+                if ((g_sysBuildNumber==18363 && MacTrafficNative::RibbonTitleFill(ribiter->second.first,lprc))
+                    || lprc->bottom == CalcRibbonHeightForDPI(ribiter->second.first, 26, false)
                     || lprc->bottom == CalcRibbonHeightForDPI(ribiter->second.first, 23, false, false)
                     || lprc->bottom == 1
                     || (lprc->bottom - lprc->top == CalcRibbonHeightForDPI(ribiter->second.first, 1)
