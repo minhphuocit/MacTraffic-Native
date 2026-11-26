@@ -1,5 +1,5 @@
 #pragma once
-// Experimental opt-in caption for the existing Explorer subclass, Win10 18363 only.
+// Experimental opt-in extra caption band for the existing Explorer subclass, Win10 18363 only.
 // No extra hooks, no desktop capture or separate top-level window.
 #include <commctrl.h>
 #include <new>
@@ -18,7 +18,7 @@ namespace MacTrafficNative {
         return api;
     }
     constexpr UINT kToggle=0x1e30;
-    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab034.State";
+    constexpr wchar_t kProp[]=L"MacTraffic.FrameLab035.State";
     struct FrameState { LONG_PTR captionBits; BOOL oldNcPaint; bool restoreNcPaint; int pressed; };
     inline FrameState* State(HWND h) {return reinterpret_cast<FrameState*>(GetPropW(h,kProp));}
     inline bool Eligible(HWND h) {
@@ -52,7 +52,7 @@ namespace MacTrafficNative {
         HMENU menu=GetSystemMenu(h,FALSE);
         if(menu&&GetMenuState(menu,kToggle,MF_BYCOMMAND)==static_cast<UINT>(-1)){
             AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-            if(AppendMenuW(menu,MF_STRING,kToggle,L"MacTraffic: Toggle test caption")) Event(6,0,0,0,0);
+            if(AppendMenuW(menu,MF_STRING,kToggle,L"MacTraffic: Toggle test caption band")) Event(6,0,0,0,0);
         }
     }
     inline void Disable(HWND h,bool destroying=false){
@@ -70,8 +70,8 @@ namespace MacTrafficNative {
         if(!Eligible(h)||IsIconic(h)||IsZoomed(h)||!Api().draw||!Api().hit){Event(6,3,1,0,0);return;}
         LONG_PTR style=GetWindowLongPtrW(h,GWL_STYLE);
         if((style&WS_CAPTION)!=WS_CAPTION){Event(6,3,2,0,0);return;}
-        RECT wr{};POINT oldOrigin{};
-        if(!GetWindowRect(h,&wr)||!ClientToScreen(h,&oldOrigin))return;
+        RECT wr{},oldClient{};POINT oldOrigin{};
+        if(!GetWindowRect(h,&wr)||!GetClientRect(h,&oldClient)||!ClientToScreen(h,&oldOrigin))return;
         auto s=new(std::nothrow) FrameState{style&WS_CAPTION,FALSE,false,-1};
         if(!s)return;
         // Only change the optional NC paint attribute if the previous value can be restored.
@@ -83,19 +83,35 @@ namespace MacTrafficNative {
             Event(6,3,3,0,0);Disable(h);return;
         }
         Refresh(h);EnsureMenu(h);
-        POINT newOrigin{};RECT newWr{},band{};
-        if(!ClientToScreen(h,&newOrigin)||!GetWindowRect(h,&newWr)||!Band(h,band)){
+        POINT newOrigin{};RECT newWr{},newClient{},band{};
+        if(!ClientToScreen(h,&newOrigin)||!GetWindowRect(h,&newWr)||!GetClientRect(h,&newClient)||!Band(h,band)){
             Event(6,3,4,0,0);Disable(h);return;
         }
-        // Compare offsets from the window, not absolute screen coordinates.
-        int before=oldOrigin.y-wr.top,after=newOrigin.y-newWr.top;
+        // The experiment intentionally reserves one extra caption band. Do not
+        // reject that expected inset, but reject unrelated layout changes.
+        const int before=oldOrigin.y-wr.top,after=newOrigin.y-newWr.top;
+        const int delta=after-before, extra=CaptionHeight(h);
+        const int tol=MulDiv(4,Dpi(h),96);
+        const int dx=(newOrigin.x-newWr.left)-(oldOrigin.x-wr.left);
+        const int dw=newClient.right-oldClient.right;
+        const int dh=newClient.bottom-oldClient.bottom;
+        const int bottomDelta=delta+dh;
         Event(6,1,before,after,band.bottom-band.top);
-        if(std::abs(before-after)>4 || std::abs((oldOrigin.x-wr.left)-(newOrigin.x-newWr.left))>4){
+        Event(10,delta,dx,dw,dh);
+        // On this build, the old Explorer frame already extended to y=0.
+        // Allow only the expected caption-height shift, with a small frame tolerance.
+        if(extra<=0 || std::abs(delta-extra)>tol || std::abs(dx)>tol ||
+           std::abs(dw)>2*tol || std::abs(bottomDelta)>tol ||
+           std::abs((newWr.right-newWr.left)-(wr.right-wr.left))>tol ||
+           std::abs((newWr.bottom-newWr.top)-(wr.bottom-wr.top))>tol ||
+           newClient.bottom<MulDiv(120,Dpi(h),96)){
             Event(6,3,5,before,after);Disable(h);return;
         }
+        Event(11,delta,extra,tol,bottomDelta);
         RECT buttons{};HRESULT hr=DwmGetWindowAttribute(h,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons));
         Event(9,static_cast<int>(hr),buttons.right-buttons.left,buttons.bottom-buttons.top,
             (GetWindowLongPtrW(h,GWL_STYLE)&WS_CAPTION)==WS_CAPTION?1:0);
+        RedrawWindow(h,nullptr,nullptr,RDW_INVALIDATE|RDW_FRAME|RDW_NOCHILDREN|RDW_UPDATENOW);
     }
     inline void Paint(HWND h){
         RECT r{};auto api=Api();if(!api.draw||!Band(h,r))return;
