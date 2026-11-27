@@ -19,5 +19,12 @@ Copy-Item -LiteralPath $dll,'blur-provider\config.ini','blur-provider\Manage-Blu
 $archive = Join-Path $PWD 'release\MacTraffic-v1.0.2-full-win-x64.zip'
 Compress-Archive -Path "$stage\*" -DestinationPath $archive -Force
 $names = @('MacTraffic-v1.0.2-win-x64.zip','MacTraffic-v1.0.2-full-win-x64.zip')
-$names | ForEach-Object { $hash = (Get-FileHash -LiteralPath (Join-Path $PWD "release\$_") -Algorithm SHA256).Hash; "$hash  $_" } | Set-Content -Encoding ascii 'release\SHA256SUMS.txt'
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $names | ForEach-Object {
+        $path = (Resolve-Path -LiteralPath (Join-Path $PWD "release\$_")).ProviderPath
+        $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($path))).Replace('-', '')
+        "$hash  $_"
+    } | Set-Content -Encoding ascii 'release\SHA256SUMS.txt'
+} finally { $sha.Dispose() }
 Write-Host "Ready: $archive"
