@@ -3,3 +3,9 @@
 /release/
 *.log
 *.lnk
+
+/dist-full/
+/blur-provider/build/
+/blur-provider/.vs/
+/blur-provider/ExplorerBlurMica/x64/
+*.pdb

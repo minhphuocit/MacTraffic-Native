@@ -2,14 +2,15 @@
 use super::*;
 use std::{io::Write, os::windows::ffi::OsStrExt, path::{Path,PathBuf}, sync::{OnceLock,Mutex,atomic::{AtomicBool,AtomicIsize,AtomicU32,Ordering}}};
 const DEFAULT_INI:&str=include_str!("../MacTraffic.ini");
-const LOG_NAME:&str="MacTraffic-v101.log";
+const LOG_NAME:&str="MacTraffic-v102-final.log";
 const MAX_LOG:u64=1024*1024;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] enum LogLevel{Normal,Debug,Off}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)] pub(super) enum ExplorerCaption{Auto,Native,SolidDark,SolidLight}
 #[derive(Debug)] pub(super) struct Config{
  pub start_paused:bool,pub browser_spacer:bool,pub office_exact_left:bool,pub alt_keys:bool,pub native_maximize:bool,
- pub browser_enabled:bool,pub office_enabled:bool,excluded:Vec<String>,level:LogLevel,
+ pub browser_enabled:bool,pub office_enabled:bool,pub explorer_caption:ExplorerCaption,excluded:Vec<String>,level:LogLevel,
 }
-impl Default for Config{fn default()->Self{Self{start_paused:false,browser_spacer:true,office_exact_left:true,alt_keys:true,native_maximize:false,browser_enabled:true,office_enabled:true,excluded:vec![],level:LogLevel::Normal}}}
+impl Default for Config{fn default()->Self{Self{start_paused:false,browser_spacer:true,office_exact_left:true,alt_keys:true,native_maximize:false,browser_enabled:true,office_enabled:true,explorer_caption:ExplorerCaption::Auto,excluded:vec![],level:LogLevel::Normal}}}
 static CONFIG:OnceLock<Config>=OnceLock::new();
 static LOG_LOCK:Mutex<()>=Mutex::new(());
 static LOG_OVERRIDE:OnceLock<bool>=OnceLock::new();
@@ -26,6 +27,7 @@ fn parse(text:&str)->Result<Config,String>{
   let (key,val)=line.split_once('=').ok_or_else(||format!("Invalid INI line {}",i+1))?;
   let val=val.trim();match key.trim().to_ascii_lowercase().as_str(){
    "start_paused"=>c.start_paused=boolean(val)?,"browser_spacer"=>c.browser_spacer=boolean(val)?,"office_exact_left"=>c.office_exact_left=boolean(val)?,"alt_keys"=>c.alt_keys=boolean(val)?,"native_maximize"=>c.native_maximize=boolean(val)?,"browser_enabled"=>c.browser_enabled=boolean(val)?,"office_enabled"=>c.office_enabled=boolean(val)?,
+   "explorer_caption"=>c.explorer_caption=match val.to_ascii_lowercase().as_str(){"auto"=>ExplorerCaption::Auto,"native"=>ExplorerCaption::Native,"solid_dark"=>ExplorerCaption::SolidDark,"solid_light"=>ExplorerCaption::SolidLight,_=>return Err("explorer_caption must be auto, native, solid_dark or solid_light".into())},
    "exclude"=>{c.excluded.clear();for item in val.split(',').map(|s|s.trim().to_ascii_lowercase()).filter(|s|!s.is_empty()){if !item.ends_with(".exe")||item.chars().any(|c|matches!(c, '\\'|'/'|':'|'*'|'?')){return Err(format!("Invalid executable exclusion: {item}"));}if !c.excluded.contains(&item){c.excluded.push(item);}}},
    "log_level"=>c.level=match val.to_ascii_lowercase().as_str(){"normal"=>LogLevel::Normal,"debug"=>LogLevel::Debug,"off"=>LogLevel::Off,_=>return Err("log_level must be normal, debug or off".into())},
    _=>return Err(format!("Unknown INI key on line {}: {key}",i+1)),
@@ -33,8 +35,24 @@ fn parse(text:&str)->Result<Config,String>{
  }Ok(c)
 }
 fn exe_path()->Result<PathBuf,String>{std::env::current_exe().map_err(|e|e.to_string())}
+fn stable_spacer_path()->Result<PathBuf,String>{
+ let root=std::env::var_os("LOCALAPPDATA").filter(|s|!s.is_empty()).ok_or("LOCALAPPDATA unavailable")?;
+ Ok(PathBuf::from(root).join("MacTraffic").join("Spacer.html"))
+}
+fn ensure_spacer()->Result<PathBuf,String>{
+ let path=stable_spacer_path()?;let parent=path.parent().ok_or("Spacer folder unavailable")?;
+ std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
+ let expected=include_bytes!("../Spacer.html");
+ match std::fs::OpenOptions::new().write(true).create_new(true).open(&path){
+  Ok(mut file)=>{file.write_all(expected).map_err(|e|e.to_string())?;},
+  Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{let current=std::fs::read(&path).map_err(|e|e.to_string())?;if current.as_slice()!=&expected[..]{return Err("Existing stable Spacer.html differs; inspect it before replacing".into());}},
+  Err(e)=>return Err(e.to_string()),
+ }
+ Ok(path)
+}
 fn config_path()->Result<PathBuf,String>{Ok(exe_path()?.with_file_name("MacTraffic.ini"))}
 pub(super) fn init()->Result<(),String>{let path=config_path()?;let contents=match std::fs::read_to_string(&path){Ok(t)=>t,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{let mut f=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e|format!("Cannot create {}: {e}",path.display()))?;f.write_all(DEFAULT_INI.as_bytes()).map_err(|e|e.to_string())?;DEFAULT_INI.to_owned()},Err(e)=>return Err(format!("Cannot read {}: {e}",path.display()))};let c=parse(&contents)?;CONFIG.set(c).map_err(|_|"Configuration already loaded".to_owned())}
+pub(super) fn prepare_spacer(){if config().browser_spacer&&config().browser_enabled{match ensure_spacer(){Ok(_)=>log("stable_spacer_ready"),Err(e)=>log(&format!("stable_spacer_failed {e}"))}}}
 pub(super) fn config()->&'static Config{CONFIG.get_or_init(Config::default)}
 fn excluded(c:&Config,exe:&str,app:App,class:&str)->bool{
  c.excluded.iter().any(|e| e.eq_ignore_ascii_case(exe)||(app==App::GenericProbe&&matches!(class,"ApplicationFrameWindow"|"Windows.UI.Core.CoreWindow")&&e=="systemsettings.exe")||(app==App::GenericProbe&&class=="SunAwtFrame"&&matches!(e.as_str(),"simpmusic.exe"|"simp-music.exe")))
@@ -43,7 +61,7 @@ pub(super) fn is_excluded(exe:&str,app:App,class:&str)->bool{excluded(config(),e
 fn log_path()->PathBuf{std::env::temp_dir().join(LOG_NAME)}
 fn normal_event(s:&str)->bool{
  let prefix=s.split_whitespace().next().unwrap_or("");
- s.starts_with("===")||s.starts_with("stop")||s.starts_with("restored=false")||prefix.contains("error")||prefix.contains("failed")||prefix.contains("panic")||matches!(prefix,"manager_ready"|"event_engine_ready"|"engine_stats"|"engine_exit_cleanup"|"release_paused"|"release_resumed"|"startup_changed"|"config_excluded"|"uia_context_created"|"uia_context_unavailable"|"owner_visibility_suspend"|"caption_visibility_recover"|"caption_retry_recovered"|"caption_auxiliary_recover"|"native_geometry_retry"|"generic_centered_wait"|"tray_unavailable")
+ s.starts_with("===")||s.starts_with("stop")||s.starts_with("restored=false")||prefix.contains("error")||prefix.contains("failed")||prefix.contains("panic")||matches!(prefix,"manager_ready"|"event_engine_ready"|"engine_stats"|"engine_exit_cleanup"|"release_paused"|"release_resumed"|"startup_changed"|"config_excluded"|"uia_context_created"|"uia_context_unavailable"|"owner_visibility_suspend"|"caption_visibility_recover"|"caption_retry_recovered"|"caption_auxiliary_recover"|"native_geometry_retry"|"generic_centered_wait"|"tray_unavailable"|"stable_spacer_ready"|"explorer_caption_policy"|"explorer_solid_band_verified"|"explorer_solid_band_rejected")
 }
 pub(super) fn write_log(s:&str){
  let level=if *LOG_OVERRIDE.get_or_init(||std::env::args().any(|a|a=="--trace-focus"||a=="--debug-log")){LogLevel::Debug}else{CONFIG.get().map_or(LogLevel::Normal,|c|c.level)};
@@ -60,11 +78,11 @@ pub(super) fn write_log(s:&str){
 #[link(name="ole32")] extern "system"{fn CoInitializeEx(reserved:*mut c_void,coinit:u32)->i32;fn CoUninitialize();fn CoCreateInstance(clsid:*const Guid,outer:*mut c_void,context:u32,iid:*const Guid,result:*mut *mut c_void)->i32;}
 pub(super) const TRAY_MESSAGE:u32=0x8002;
 pub(super) const TOGGLE_ID:i32=6;
-pub(super) const MENU_TOGGLE:u32=1;pub(super) const MENU_EXIT:u32=2;const MENU_CONFIG:u32=3;const MENU_LOG:u32=4;const MENU_STARTUP:u32=5;
+pub(super) const MENU_TOGGLE:u32=1;pub(super) const MENU_EXIT:u32=2;const MENU_CONFIG:u32=3;const MENU_LOG:u32=4;const MENU_STARTUP:u32=5;const MENU_SPACER:u32=7;const MENU_BLUR_HELP:u32=8;
 pub(super) struct Tray{hwnd:H,added:bool,pub taskbar_created:u32,last_attempt:Instant}
 impl Tray{
  pub(super) unsafe fn new(hwnd:H)->Self{let mut s=Self{hwnd,added:false,taskbar_created:RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),last_attempt:Instant::now()};TRAY_OWNER.store(hwnd,Ordering::Release);TASKBAR_MESSAGE.store(s.taskbar_created,Ordering::Release);s.readd();s}
- unsafe fn data(&self)->NotifyData{let mut n:NotifyData=zeroed();n.size=size_of::<NotifyData>() as u32;n.hwnd=self.hwnd;n.id=1;n.flags=1|2|4;n.callback=TRAY_MESSAGE;n.icon=LoadIconW(0,32512usize as *const u16);let tip=if PAUSED.load(Ordering::Relaxed){"MacTraffic 1.0.1 - Paused"}else{"MacTraffic 1.0.1 - Running"};for (a,b) in n.tip.iter_mut().zip(tip.encode_utf16()){*a=b;}n}
+ unsafe fn data(&self)->NotifyData{let mut n:NotifyData=zeroed();n.size=size_of::<NotifyData>() as u32;n.hwnd=self.hwnd;n.id=1;n.flags=1|2|4;n.callback=TRAY_MESSAGE;n.icon=LoadIconW(0,32512usize as *const u16);let tip=if PAUSED.load(Ordering::Relaxed){"MacTraffic 1.0.2 - Paused"}else{"MacTraffic 1.0.2 - Running"};for (a,b) in n.tip.iter_mut().zip(tip.encode_utf16()){*a=b;}n}
  pub(super) unsafe fn readd(&mut self){self.last_attempt=Instant::now();let mut n=self.data();self.added=Shell_NotifyIconW(0,&mut n)!=0;if !self.added{log("tray_unavailable Ctrl+Alt+P / F12 still available");}}
  pub(super) unsafe fn refresh(&mut self){if self.added{let mut n=self.data();if Shell_NotifyIconW(1,&mut n)==0{self.added=false;}}}
  pub(super) unsafe fn retry(&mut self){if TRAY_READD.swap(false,Ordering::AcqRel)||(!self.added&&self.last_attempt.elapsed()>=Duration::from_secs(5)){self.readd();}}
@@ -74,6 +92,7 @@ impl Tray{
   let add=|id:u32,label:&str,flags:u32|{AppendMenuW(menu,flags,id as usize,wide(label).as_ptr());};
   add(MENU_TOGGLE,if paused{"Resume MacTraffic (Ctrl+Alt+P)"}else{"Pause MacTraffic (Ctrl+Alt+P)"},0);
   add(MENU_CONFIG,"Edit configuration (restart to apply)",0);add(MENU_LOG,"Open log",0);
+  add(MENU_SPACER,"Open stable browser Spacer folder",0);add(MENU_BLUR_HELP,"Explorer blur setup (optional provider)",0);
   add(MENU_STARTUP,if startup_on{"Disable start with Windows"}else{"Enable start with Windows"},if startup.is_none(){1}else{0});
   AppendMenuW(menu,0x800,0,null());add(MENU_EXIT,"Exit and restore (Ctrl+Alt+F12)",0);
   let mut p=Point::default();GetCursorPos(&mut p);SetForegroundWindow(self.hwnd);
@@ -97,13 +116,19 @@ fn create_startup(path:&Path)->Result<(),String>{unsafe{
  type SetString=unsafe extern "system" fn(*mut c_void,*const u16)->i32;
  let set_path:SetString=std::mem::transmute(link.slot(20));check_hr(set_path(link.0,path_wide(&exe).as_ptr()),"Set shortcut target")?;
  let set_dir:SetString=std::mem::transmute(link.slot(9));check_hr(set_dir(link.0,path_wide(parent).as_ptr()),"Set working directory")?;
- let set_desc:SetString=std::mem::transmute(link.slot(7));check_hr(set_desc(link.0,wide("MacTraffic 1.0.1").as_ptr()),"Set description")?;
+ let set_desc:SetString=std::mem::transmute(link.slot(7));check_hr(set_desc(link.0,wide("MacTraffic 1.0.2").as_ptr()),"Set description")?;
  let qi:unsafe extern "system" fn(*mut c_void,*const Guid,*mut *mut c_void)->i32=std::mem::transmute(link.slot(0));let mut p=null_mut();check_hr(qi(link.0,&persist,&mut p),"Query IPersistFile")?;if p.is_null(){return Err("IPersistFile unavailable".into());}let file=ComPtr(p);
  let save:unsafe extern "system" fn(*mut c_void,*const u16,i32)->i32=std::mem::transmute(file.slot(6));check_hr(save(file.0,path_wide(path).as_ptr(),1),"Save Startup shortcut")
 }}
 #[link(name="kernel32")] extern "system"{fn GetSystemDirectoryW(buffer:*mut u16,size:u32)->u32;}
 fn open_text(path:&Path)->Result<(),String>{let mut buf=[0u16;260];let n=unsafe{GetSystemDirectoryW(buf.as_mut_ptr(),buf.len() as u32)} as usize;if n==0||n>=buf.len(){return Err("System directory unavailable".into());}use std::os::windows::ffi::OsStringExt;let notepad=PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])).join("notepad.exe");std::process::Command::new(notepad).arg(path).spawn().map(|_|()).map_err(|e|e.to_string())}
+fn open_spacer_folder()->Result<(),String>{
+ let p=ensure_spacer()?;let parent=p.parent().ok_or("Spacer folder unavailable")?;
+ let root=std::env::var_os("SystemRoot").filter(|s|!s.is_empty()).ok_or("SystemRoot unavailable")?;
+ std::process::Command::new(PathBuf::from(root).join("explorer.exe")).arg(parent).spawn().map(|_|()).map_err(|e|e.to_string())
+}
 pub(super) fn menu_action(cmd:u32)->Result<(),String>{match cmd{
+ MENU_SPACER=>open_spacer_folder(),MENU_BLUR_HELP=>{let p=exe_path()?.with_file_name("EXPLORER-BLUR.md");open_text(&p)},
  MENU_CONFIG=>open_text(&config_path()?),MENU_LOG=>{let p=log_path();if !p.exists(){return Err("Log does not exist; set log_level=normal or debug and restart".into());}open_text(&p)},
  MENU_STARTUP=>{let p=startup_path()?;if p.exists(){std::fs::remove_file(p).map_err(|e|e.to_string())?;log("startup_changed enabled=false");}else{create_startup(&p)?;log("startup_changed enabled=true");}Ok(())},_=>Ok(())}}
 #[cfg(test)] mod tests{use super::*;
@@ -111,5 +136,6 @@ pub(super) fn menu_action(cmd:u32)->Result<(),String>{match cmd{
  #[test] fn ini_bom_and_exclude(){let c=parse("\u{feff}[MacTraffic]\nexclude= BRAVE.EXE, systemsettings.exe, brave.exe\nstart_paused=yes").unwrap();assert!(c.start_paused);assert_eq!(c.excluded.len(),2);assert!(excluded(&c,"brave.exe",App::BrowserProbe,"Chrome_WidgetWin_1"));assert!(excluded(&c,"applicationframehost.exe",App::GenericProbe,"ApplicationFrameWindow"));assert!(!excluded(&c,"applicationframehost.exe",App::Other,"ApplicationFrameWindow"));}
  #[test] fn invalid_ini_fails_closed(){for x in ["exclude=C:\\x.exe","exclude=*.exe","browser_spacer=maybe","unexpected=1","garbage","log_level=trace"]{assert!(parse(x).is_err(),"{x}");}}
  #[test] fn log_policy(){assert!(normal_event("target_error hwnd=1"));assert!(normal_event("engine_exit_cleanup sessions=3"));assert!(!normal_event("generic_centered_verified hwnd=1"));assert!(!normal_event("browser_spacer_probe hwnd=1"));}
+ #[test] fn explorer_caption_config(){assert_eq!(parse(DEFAULT_INI).unwrap().explorer_caption,ExplorerCaption::Auto);assert_eq!(parse("explorer_caption=solid_dark").unwrap().explorer_caption,ExplorerCaption::SolidDark);assert_eq!(parse("explorer_caption=native").unwrap().explorer_caption,ExplorerCaption::Native);assert!(parse("explorer_caption=blur").is_err());}
  #[test] fn notify_abi(){if size_of::<usize>()==8{assert_eq!(size_of::<NotifyData>(),976);}}
 }

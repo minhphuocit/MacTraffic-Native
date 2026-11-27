@@ -5,6 +5,7 @@
 use std::{collections::HashMap, ffi::c_void, mem::{size_of,zeroed}, ptr::{null,null_mut}, time::{Duration,Instant}};
 mod custom_caption;
 mod release;
+mod explorer_caption;
 type H=isize; type W=usize; type L=isize;
 const BUTTON_BITS:u32=0x000b0000;
 const WS_CAPTION:u32=0x00c00000;
@@ -385,7 +386,7 @@ fn console_title_dark(h:H,left:Layout,center:Layout,fallback:bool)->bool{unsafe{
  ReleaseDC(0,dc);if n==0{fallback}else{sum/n>=145}
 }}
 // Draw ONLY the title glyphs into an alpha surface; no desktop pixels are read.
-fn present_title(h:H,l:Layout,title:&[u16],dark_text:bool)->bool{unsafe{
+fn present_title(h:H,l:Layout,title:&[u16],dark_text:bool,fill:Option<u32>,text_layout:Layout)->bool{unsafe{
  let dc=CreateCompatibleDC(0);if dc==0{return false;}
  let info=BitmapInfo{size:40,width:l.w,height:-l.h,planes:1,bits:32,compression:0,image_size:0,xppm:0,yppm:0,used:0,important:0,colors:0};
  let mut bits=null_mut();let bmp=CreateDIBSection(dc,&info,0,&mut bits,0,0);
@@ -398,11 +399,15 @@ fn present_title(h:H,l:Layout,title:&[u16],dark_text:bool)->bool{unsafe{
     let old_font=SelectObject(dc,font);
     if old_font!=0&&old_font != -1{
      let n=l.w as usize*l.h as usize;std::ptr::write_bytes(bits.cast::<u32>(),0,n);
-     SetTextColor(dc,0xffffff);SetBkMode(dc,1);
-     let mut r=Rect{left:0,top:0,right:l.w,bottom:l.h};
+     let pixels=std::slice::from_raw_parts_mut(bits.cast::<u32>(),n);
+     if let Some(color)=fill{pixels.fill(color);}
+     SetTextColor(dc,if fill.is_some()&&dark_text{0x181818}else if fill.is_some(){0xf0f0f0}else{0xffffff});SetBkMode(dc,1);
+     let x=text_layout.pos.x-l.pos.x;let y=text_layout.pos.y-l.pos.y;
+     let mut r=Rect{left:x,top:y,right:x+text_layout.w,bottom:y+text_layout.h};
      if DrawTextW(dc,title.as_ptr(),title.len() as i32,&mut r,0x8825)>0&&GdiFlush()!=0{
       let pixels=std::slice::from_raw_parts_mut(bits.cast::<u32>(),n);
-      for v in pixels.iter_mut(){let a=((*v>>16)&255).max((*v>>8)&255).max(*v&255);let c=if dark_text{a*24/255}else{a*240/255};*v=(a<<24)|(c<<16)|(c<<8)|c;}
+      if fill.is_some(){for v in pixels.iter_mut(){*v|=0xff000000;}}
+      else{for v in pixels.iter_mut(){let a=((*v>>16)&255).max((*v>>8)&255).max(*v&255);let c=if dark_text{a*24/255}else{a*240/255};*v=(a<<24)|(c<<16)|(c<<8)|c;}}
       let size=Point{x:l.w,y:l.h};let origin=Point{x:0,y:0};let blend=Blend{operation:0,flags:0,alpha:255,format:1};
       ok=UpdateLayeredWindow(h,0,&l.pos,&size,dc,&origin,0,&blend,2)!=0;
      }
@@ -625,7 +630,7 @@ fn native_slot_ok(l:Layout)->bool{!l.fallback_row}
 struct Target{
  app:App,
  theme:Option<ThemeGuard>,title_cache:Option<(Layout,Vec<u16>)>,theme_failed:bool,
- title_dark:bool,
+ title_dark:bool,explorer_fill:Option<u32>,band_attempt:Option<(Layout,bool)>,
  guard:Restore,gap:i32,top:i32,dpi:u32,last:Layout,shown:bool,
  last_zoom:bool,refresh:bool,misses:u32,hover:bool,
  ribbon_margin_preferred:bool,frame_extent:Option<(i32,i32)>,theme_due:Option<Instant>,zoom_repaint_due:Option<Instant>,ribbon_due:Option<Instant>,ribbon_check:Instant,ribbon_alt_key:Option<(Rect,Vec<u16>)>,ribbon_alt:Option<Layout>,ribbon_alt_due:Option<Instant>,ribbon_scan:custom_caption::RibbonScan,
@@ -652,7 +657,7 @@ impl Target{
   let hidden=d.rect(h,5).ok_or("Cannot verify stock button bounds")?;
   if style(h)&WS_CAPTION!=WS_CAPTION||hidden.right!=hidden.left{return Err("Native caption preservation or stock removal failed".into());}
   log(&format!("attach hwnd={h:#x} app={app:?} caption=true stock_width=0 original_bounds={b:?} gap={gap} top={top} maximized={}",IsZoomed(h)!=0));
-  Ok(Self{app,theme:None,title_cache:None,theme_failed:false,title_dark:false,guard,gap,top,dpi,last:initial,shown:false,last_zoom:IsZoomed(h)!=0,refresh:true,misses:0,hover:false,ribbon_margin_preferred:false,frame_extent:None,theme_due:None,zoom_repaint_due:None,ribbon_due:None,ribbon_check:Instant::now(),ribbon_alt_key:None,ribbon_alt:None,ribbon_alt_due:None,ribbon_scan:custom_caption::RibbonScan::default()})
+  Ok(Self{app,theme:None,title_cache:None,theme_failed:false,title_dark:false,explorer_fill:if app==App::Explorer{explorer_caption::choose_fill(h)}else{None},band_attempt:None,guard,gap,top,dpi,last:initial,shown:false,last_zoom:IsZoomed(h)!=0,refresh:true,misses:0,hover:false,ribbon_margin_preferred:false,frame_extent:None,theme_due:None,zoom_repaint_due:None,ribbon_due:None,ribbon_check:Instant::now(),ribbon_alt_key:None,ribbon_alt:None,ribbon_alt_due:None,ribbon_scan:custom_caption::RibbonScan::default()})
  }}
  fn needs_fast_tick(&self)->bool{!self.shown||self.refresh||self.misses>0||self.theme_due.is_some()||self.zoom_repaint_due.is_some()||self.ribbon_due.is_some()||self.ribbon_alt_due.is_some()}
  fn tick(&mut self,d:&Dwm,sprite:H,title_sprite:H,mode:u8,dark_text:bool, safe_zoom:bool,console_left:bool,native_left:bool)->Result<(),String>{unsafe{
@@ -728,17 +733,32 @@ impl Target{
       self.theme.take();self.theme_failed=true;ShowWindow(title_sprite,0);self.title_cache=None;
       log(&format!("native_left_skip hwnd={h:#x} app={:?} reason=ribbon_slot_not_verified",self.app));
      }else{
-     let needs_title=self.title_cache.as_ref().map_or(true,|(l,t)|*l!=center||t!=&text)||IsWindowVisible(title_sprite)==0;
+     let mut title_layout=center;let mut fill=None;
+     if let (Some(color),Some(frame))=(self.explorer_fill,slot_frame){
+      if let Some(band)=explorer_caption::candidate(h,frame,center,left){
+       let same=self.band_attempt.is_some_and(|(old,_)|old==band);
+       if !same{
+        // Verify only on changed geometry, never in background or every timer tick.
+        let ok=custom_caption::caption_hits(h,Layout{pos:Point{x:band.pos.x,y:center.pos.y},h:center.h,..band});
+        self.band_attempt=Some((band,ok));
+        log(&format!("{} hwnd={h:#x}",if ok{"explorer_solid_band_verified"}else{"explorer_solid_band_rejected"}));
+       }
+       if self.band_attempt==Some((band,true)){title_layout=band;fill=Some(color);}
+      }
+     }
+     let needs_title=self.title_cache.as_ref().map_or(true,|(l,t)|*l!=title_layout||t!=&text)||IsWindowVisible(title_sprite)==0;
      if needs_title{
-      let move_only=IsWindowVisible(title_sprite)!=0&&self.title_cache.as_ref().map_or(false,|(old,t)|old.w==center.w&&old.h==center.h&&old.dpi==center.dpi&&t==&text);
+      let move_only=fill.is_none()&&IsWindowVisible(title_sprite)!=0&&self.title_cache.as_ref().map_or(false,|(old,t)|old.w==title_layout.w&&old.h==title_layout.h&&old.dpi==title_layout.dpi&&t==&text);
       if move_only{
-       if SetWindowPos(title_sprite,0,center.pos.x,center.pos.y,0,0,0x0215)==0{return Err("Centered title move failed".into());}
+       if SetWindowPos(title_sprite,0,title_layout.pos.x,title_layout.pos.y,0,0,0x0215)==0{return Err("Centered title move failed".into());}
       }else{
-       self.title_dark=if self.app==App::Console||new_native{console_title_dark(h,left,center,dark_text)}else{dark_text};
-       if !present_title(title_sprite,center,&text,self.title_dark)||SetWindowPos(title_sprite,0,center.pos.x,center.pos.y,0,0,0x0251)==0{return Err("Centered title rendering failed".into());}
+       self.title_dark=if let Some(c)=fill{c&255>=145}else if self.app==App::Console||new_native{console_title_dark(h,left,center,dark_text)}else{dark_text};
+       if GetForegroundWindow()!=h{return Err("Focus changed before title present".into());}
+       if !present_title(title_sprite,title_layout,&text,self.title_dark,fill,center)||SetWindowPos(title_sprite,0,title_layout.pos.x,title_layout.pos.y,0,0,0x0251)==0{return Err("Centered title rendering failed".into());}
+       if fill.is_some(){self.refresh=true;} // keep the button sprite above the solid band
        log(&format!("center_title_present x={} width={} chars={}",center.pos.x,center.w,text.len()));
       }
-      self.title_cache=Some((center,text));
+      self.title_cache=Some((title_layout,text));
      }
      next=left;
      }
@@ -876,6 +896,7 @@ fn caption_retry_delay(h:H,attempt:&mut usize)->Option<Duration>{
  const MS:[u64;13]=[40,80,120,160,250,400,600,800,1000,1500,2000,2500,3000];
  let delay=*MS.get(*attempt)?;*attempt+=1;Some(Duration::from_millis(delay))
 }
+#[cfg(test)]
 fn arm_explorer_retry(h:H,app:App,attempt:&mut usize,reason:&str)->Option<Instant>{
  if app!=App::Explorer{return None;}
  match explorer_retry_delay(attempt){
@@ -1067,6 +1088,7 @@ fn run()->Result<(),String>{unsafe{
  if !left&&!left_alt{return Err("No left-layout shortcut available; no styles changed.".into());}
  let _toggle_key=register_key(manager.0,release::TOGGLE_ID,0x50,"P");
  release::PAUSED.store(cfg.start_paused,std::sync::atomic::Ordering::Release);
+ release::prepare_spacer();
  let mut tray=release::Tray::new(manager.0);
  if SetTimer(manager.0,1,if cfg.start_paused{1000}else{40},0)==0{return Err("Timer unavailable; no styles changed.".into());}
  // No foreign-process code or injection. Keep a watchdog if events fail.
@@ -1109,7 +1131,7 @@ fn run()->Result<(),String>{unsafe{
    }
    tray.refresh();wake_manager();continue;
   }
-  if tray_cmd!=0{if let Err(e)=release::menu_action(tray_cmd){log(&format!("tray_action_error {e}"));MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic 1.0.1").as_ptr(),0x30);}continue;}
+  if tray_cmd!=0{if let Err(e)=release::menu_action(tray_cmd){log(&format!("tray_action_error {e}"));MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic 1.0.2").as_ptr(),0x30);}continue;}
   if m.message==release::TRAY_MESSAGE&&m.hwnd==manager.0{continue;}
   if m.message==0x0312&&release::PAUSED.load(std::sync::atomic::Ordering::Relaxed){continue;}
   if let Some((key,label))=if m.message==0x0312{layout_key(m.wparam)}else{None}{
@@ -1143,7 +1165,12 @@ fn run()->Result<(),String>{unsafe{
    }
    if fg!=foreground{
     foreground=fg;foreground_app=sessions.get(&fg).map(|s|s.app).unwrap_or_else(||inspect_app(&d,fg,explorer_only,trace_focus));
-    if let Some(s)=sessions.get_mut(&fg){s.rearm();s.custom.resume();log(&format!("session_resume hwnd={fg:#x}"));}
+    if let Some(s)=sessions.get_mut(&fg){s.rearm();s.custom.resume();
+     if let Some(t)=s.active.as_mut(){if t.app==App::Explorer&&owner_presentable(&d,fg){
+      let fill=explorer_caption::choose_fill(fg);
+      if t.explorer_fill!=fill{t.explorer_fill=fill;t.band_attempt=None;t.title_cache=None;t.refresh=true;}
+      else if t.band_attempt.is_some_and(|(_,ok)|!ok){t.band_attempt=None;}
+     }}log(&format!("session_resume hwnd={fg:#x}"));}
     inspect_attempt=0;inspect_due=None;
     if foreground_app==App::Other&&maybe_new_caption(fg){inspect_due=caption_retry_delay(fg,&mut inspect_attempt).map(|delay|Instant::now()+delay);}
    }
@@ -1250,7 +1277,7 @@ fn run()->Result<(),String>{unsafe{
  custom_caption::shutdown_workers();
  drop(tray);drop(manager);result
 }}
-fn main(){let result=release::init().and_then(|_|{log(&format!("=== MacTraffic v1.0.1 pid={} ===",std::process::id()));run()});if let Err(e)=result{log(&format!("stop error: {e}"));unsafe{MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic v1.0.1").as_ptr(),0x30);}}}
+fn main(){let result=release::init().and_then(|_|{log(&format!("=== MacTraffic v1.0.2 pid={} ===",std::process::id()));run()});if let Err(e)=result{log(&format!("stop error: {e}"));unsafe{MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic v1.0.2").as_ptr(),0x30);}}}
 
 #[cfg(test)] mod performance_tests{use super::*;
  #[test] fn overlap_is_strict(){let a=Rect{left:0,top:0,right:80,bottom:30};assert!(overlaps(a,Rect{left:79,..a}));assert!(!overlaps(a,Rect{left:80,right:100,..a}));assert!(!overlaps(a,Rect{top:30,bottom:60,..a}));}

@@ -1,49 +1,51 @@
-name: Windows GNU release build
+name: Windows GNU core and optional Explorer blur build
 on:
   workflow_dispatch:
   push:
-    tags: ['v1.0.1']
+    tags: ['v1.0.2']
   pull_request:
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
     steps:
       - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
       - name: Install Rust GNU
         shell: pwsh
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc -Vv
-      - name: Build, test and package
-        shell: cmd
-        run: package.cmd
+      - name: Build, test and package both variants
+        shell: pwsh
+        run: ./package-full.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: MacTraffic-v1.0.1-win-x64
+          name: MacTraffic-v1.0.2-win-x64
           path: |
-            release/MacTraffic-v1.0.1-win-x64.zip
+            release/MacTraffic-v1.0.2-win-x64.zip
+            release/MacTraffic-v1.0.2-full-win-x64.zip
             release/SHA256SUMS.txt
           if-no-files-found: error
   draft-release:
-    if: github.ref == 'refs/tags/v1.0.1'
+    if: github.ref == 'refs/tags/v1.0.2'
     needs: build
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: MacTraffic-v1.0.1-win-x64
+          name: MacTraffic-v1.0.2-win-x64
           path: release
       - name: Create draft release for manual approval
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v1.0.1 --repo '${{ github.repository }}' --verify-tag --draft --title 'MacTraffic v1.0.1' --notes 'Windows x64 GNU portable build. Publish only after desktop acceptance.' release/MacTraffic-v1.0.1-win-x64.zip release/SHA256SUMS.txt
+          gh release create v1.0.2 --repo '${{ github.repository }}' --verify-tag --draft --title 'MacTraffic v1.0.2 - Core and optional Explorer blur' --notes 'Core Rust portable and optional C++ ExplorerBlurMica companion. The full package requires explicit registration for blur. Publish only after desktop acceptance.' release/MacTraffic-v1.0.2-win-x64.zip release/MacTraffic-v1.0.2-full-win-x64.zip release/SHA256SUMS.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

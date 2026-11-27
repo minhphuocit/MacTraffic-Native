@@ -9,5 +9,7 @@ if not exist "dist\MacTraffic.ini" copy "MacTraffic.ini" "dist\MacTraffic.ini" >
 if not exist "dist\MacTraffic.ini" exit /b 1
 copy /y "Spacer.html" "dist\Spacer.html" >nul || exit /b 1
 copy /y "README.md" "dist\README.md" >nul || exit /b 1
+copy /y "EXPLORER-BLUR.md" "dist\EXPLORER-BLUR.md" >nul || exit /b 1
+copy /y "CLEAN-INSTALL.md" "dist\CLEAN-INSTALL.md" >nul || exit /b 1
 echo Ready: dist\MacTraffic.exe
 exit /b 0
