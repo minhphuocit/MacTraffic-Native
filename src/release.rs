@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::Write, os::windows::ffi::OsStrExt, path::{Path,PathBuf}, sync::{OnceLock,Mutex,atomic::{AtomicBool,AtomicIsize,AtomicU32,Ordering}}};
 const DEFAULT_INI:&str=include_str!("../MacTraffic.ini");
-const LOG_NAME:&str="MacTraffic-v102-final.log";
+const LOG_NAME:&str="MacTraffic-v103-title-fix.log";
 const MAX_LOG:u64=1024*1024;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] enum LogLevel{Normal,Debug,Off}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub(super) enum ExplorerCaption{Auto,Native,SolidDark,SolidLight}
@@ -82,7 +82,7 @@ pub(super) const MENU_TOGGLE:u32=1;pub(super) const MENU_EXIT:u32=2;const MENU_C
 pub(super) struct Tray{hwnd:H,added:bool,pub taskbar_created:u32,last_attempt:Instant}
 impl Tray{
  pub(super) unsafe fn new(hwnd:H)->Self{let mut s=Self{hwnd,added:false,taskbar_created:RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),last_attempt:Instant::now()};TRAY_OWNER.store(hwnd,Ordering::Release);TASKBAR_MESSAGE.store(s.taskbar_created,Ordering::Release);s.readd();s}
- unsafe fn data(&self)->NotifyData{let mut n:NotifyData=zeroed();n.size=size_of::<NotifyData>() as u32;n.hwnd=self.hwnd;n.id=1;n.flags=1|2|4;n.callback=TRAY_MESSAGE;n.icon=LoadIconW(0,32512usize as *const u16);let tip=if PAUSED.load(Ordering::Relaxed){"MacTraffic 1.0.2 - Paused"}else{"MacTraffic 1.0.2 - Running"};for (a,b) in n.tip.iter_mut().zip(tip.encode_utf16()){*a=b;}n}
+ unsafe fn data(&self)->NotifyData{let mut n:NotifyData=zeroed();n.size=size_of::<NotifyData>() as u32;n.hwnd=self.hwnd;n.id=1;n.flags=1|2|4;n.callback=TRAY_MESSAGE;n.icon=LoadIconW(0,32512usize as *const u16);let tip=if PAUSED.load(Ordering::Relaxed){"MacTraffic 1.0.3 - Paused"}else{"MacTraffic 1.0.3 - Running"};for (a,b) in n.tip.iter_mut().zip(tip.encode_utf16()){*a=b;}n}
  pub(super) unsafe fn readd(&mut self){self.last_attempt=Instant::now();let mut n=self.data();self.added=Shell_NotifyIconW(0,&mut n)!=0;if !self.added{log("tray_unavailable Ctrl+Alt+P / F12 still available");}}
  pub(super) unsafe fn refresh(&mut self){if self.added{let mut n=self.data();if Shell_NotifyIconW(1,&mut n)==0{self.added=false;}}}
  pub(super) unsafe fn retry(&mut self){if TRAY_READD.swap(false,Ordering::AcqRel)||(!self.added&&self.last_attempt.elapsed()>=Duration::from_secs(5)){self.readd();}}
@@ -116,7 +116,7 @@ fn create_startup(path:&Path)->Result<(),String>{unsafe{
  type SetString=unsafe extern "system" fn(*mut c_void,*const u16)->i32;
  let set_path:SetString=std::mem::transmute(link.slot(20));check_hr(set_path(link.0,path_wide(&exe).as_ptr()),"Set shortcut target")?;
  let set_dir:SetString=std::mem::transmute(link.slot(9));check_hr(set_dir(link.0,path_wide(parent).as_ptr()),"Set working directory")?;
- let set_desc:SetString=std::mem::transmute(link.slot(7));check_hr(set_desc(link.0,wide("MacTraffic 1.0.2").as_ptr()),"Set description")?;
+ let set_desc:SetString=std::mem::transmute(link.slot(7));check_hr(set_desc(link.0,wide("MacTraffic 1.0.3").as_ptr()),"Set description")?;
  let qi:unsafe extern "system" fn(*mut c_void,*const Guid,*mut *mut c_void)->i32=std::mem::transmute(link.slot(0));let mut p=null_mut();check_hr(qi(link.0,&persist,&mut p),"Query IPersistFile")?;if p.is_null(){return Err("IPersistFile unavailable".into());}let file=ComPtr(p);
  let save:unsafe extern "system" fn(*mut c_void,*const u16,i32)->i32=std::mem::transmute(file.slot(6));check_hr(save(file.0,path_wide(path).as_ptr(),1),"Save Startup shortcut")
 }}

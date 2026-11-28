@@ -11,6 +11,9 @@ const BUTTON_BITS:u32=0x000b0000;
 const WS_CAPTION:u32=0x00c00000;
 const THEME_HIDE:u32=0x00000001|0x00000002; // native caption text + system icon; not the Ribbon QAT
 const FRAME_SETTLE:Duration=Duration::from_millis(160);
+const COVERED_GRACE:Duration=Duration::from_millis(650);
+fn coverage_expired(since:&mut Option<Instant>,now:Instant)->bool{now.saturating_duration_since(*since.get_or_insert(now))>=COVERED_GRACE}
+fn settings_owner_allowed(is_settings:bool,is_root:bool,has_owner:bool)->bool{is_root&&(!has_owner||is_settings)}
 const LEFT_MARGIN_DIP:i32=8; // was 3; browser spacer keeps its measured center
 // Paint/WordPad originally passed at scale(3)+scale(5); try the new margin first.
 fn ribbon_left_x(frame_left:i32,dpi:u32,preferred:bool)->i32{frame_left+scale(if preferred{LEFT_MARGIN_DIP}else{3},dpi)+scale(5,dpi)}
@@ -223,6 +226,9 @@ fn zoom_fits(actual:Rect,work:Rect,console:bool,dpi:u32)->bool{
  actual.right<=work.right+3&&work.right-actual.right<=slack&&
  actual.bottom<=work.bottom+3&&work.bottom-actual.bottom<=slack
 }
+fn custom_zoom_native_fallback(office:bool,workzoom:bool,reserved_top:bool,already_maximized:bool)->bool{
+ !office||!workzoom||!reserved_top||already_maximized
+}
 fn toggle_work_zoom(d:&Dwm,h:H,zooms:&mut HashMap<H,WorkZoom>,legacy_copy:bool,console:bool)->bool{
  if let Some(z)=zooms.remove(&h){
   if zoom_matches(h,z)&&zoom_restore_visible(z.before){
@@ -258,6 +264,7 @@ fn toggle_work_zoom(d:&Dwm,h:H,zooms:&mut HashMap<H,WorkZoom>,legacy_copy:bool,c
  #[test] fn finder_workarea(){let outer=Rect{left:93,top:100,right:1107,bottom:807};let visible=Rect{left:100,top:100,right:1100,bottom:800};let work=Rect{left:0,top:24,right:1920,bottom:1080};assert_eq!(zoom_rect(outer,visible,work),Some(Rect{left:-7,top:24,right:1927,bottom:1087}));}
  #[test] fn invalid_margins(){let r=Rect{left:0,top:0,right:800,bottom:600};assert!(zoom_rect(r,Rect{left:-1,..r},r).is_none());}
  #[test] fn console_cell_rounding(){let w=Rect{left:0,top:24,right:1920,bottom:1080};let r=Rect{right:1912,bottom:1063,..w};assert!(zoom_fits(r,w,true,96));assert!(!zoom_fits(r,w,false,96));assert!(!zoom_fits(Rect{top:23,..r},w,true,96));assert!(!zoom_fits(Rect{bottom:1000,..r},w,true,96));}
+ #[test] fn office_reserved_top_blocks_native_fallback(){assert!(!custom_zoom_native_fallback(true,true,true,false));assert!(custom_zoom_native_fallback(true,true,true,true));assert!(custom_zoom_native_fallback(true,true,false,false));assert!(custom_zoom_native_fallback(true,false,true,false));assert!(custom_zoom_native_fallback(false,true,true,false));}
  #[test] fn changed_geometry(){let r=Rect{left:0,top:24,right:1920,bottom:1080};assert!(near_rect(r,Rect{top:26,..r},3));assert!(!near_rect(r,Rect{top:28,..r},3));}
 }
 #[derive(Clone,Copy,PartialEq,Eq,Debug)] struct Layout{pos:Point,w:i32,h:i32,dpi:u32,work_top:Option<i32>,fallback_row:bool,left_slot:bool}
@@ -544,12 +551,33 @@ fn supplemental_app(class:&str,exe:&str,settings_child:bool,title:&str)->App{
  App::Other
 }
 unsafe extern "system" fn settings_child_cb(h:H,data:L)->i32{
- if class_name(h)=="Windows.UI.Core.CoreWindow"&&query_name(identity(h).1).is_ok_and(|s|s=="systemsettings.exe"){
+ if settings_exe(identity(h).1).is_some_and(|s|s=="systemsettings.exe"){
   *(data as *mut bool)=true;return 0;
  }
  1
 }
 fn has_settings_child(h:H)->bool{let mut found=false;unsafe{EnumChildWindows(h,Some(settings_child_cb),(&mut found as *mut bool) as L);}found}
+fn settings_exe(pid:u32)->Option<String>{query_name(pid).ok().or_else(||snapshot_name(pid))}
+// UIA may report the hosted Settings process rather than ApplicationFrameHost.
+unsafe extern "system" fn settings_pid_cb(h:H,data:L)->i32{
+ let state=&mut *(data as *mut (u32,bool));
+ if identity(h).1==state.0{state.1=true;return 0;}1
+}
+fn verified_settings_uia_pid(h:H,pid:u32)->bool{
+ if pid==0||!verified_settings_frame(h)||!settings_exe(pid).is_some_and(|s|s=="systemsettings.exe"){return false;}
+ let mut state=(pid,false);unsafe{EnumChildWindows(h,Some(settings_pid_cb),(&mut state as *mut (u32,bool)) as L);};state.1
+}
+fn verified_settings_frame(h:H)->bool{
+ let class=class_name(h);if !matches!(class.as_str(),"ApplicationFrameWindow"|"Windows.UI.Core.CoreWindow"){return false;}
+ let exe=settings_exe(identity(h).1).unwrap_or_default();
+ exe=="systemsettings.exe"||(class=="ApplicationFrameWindow"&&exe=="applicationframehost.exe"&&has_settings_child(h))
+}
+fn verified_owned_office_frame(h:H)->bool{
+ let owner=unsafe{window_neighbor(h,4)};
+ if owner==0{return false;}
+ let pid=identity(h).1;
+ pid!=0&&identity(owner).1==pid&&query_name(pid).is_ok_and(|exe|classify(&class_name(h),&exe)==App::OfficeProbe)
+}
 fn usable_window(h:H)->bool{unsafe{h!=0&&IsWindow(h)!=0&&IsWindowVisible(h)!=0&&IsIconic(h)==0}}
 fn visibility_allowed(usable:bool,cloaked:bool)->bool{usable&&!cloaked}
 fn owner_presentable(d:&Dwm,h:H)->bool{let usable=usable_window(h);visibility_allowed(usable,usable&&d.cloaked(h))}
@@ -586,7 +614,7 @@ fn inspect_app(d:&Dwm,h:H,explorer_only:bool,trace_focus:bool)->App{
  let (_,pid)=identity(h);
  let (exe,source,error)=match query_name(pid){
   Ok(name)=>(name,"query",0),
-  Err(e) if console=>match snapshot_name(pid){Some(name)=>(name,"snapshot",e),None=>(String::new(),"unavailable",e)},
+  Err(e) if console||matches!(class.as_str(),"OpusApp"|"XLMAIN"|"PPTFrameClass"|"ApplicationFrameWindow"|"Windows.UI.Core.CoreWindow")=>match snapshot_name(pid){Some(name)=>(name,"snapshot",e),None=>(String::new(),"unavailable",e)},
   Err(e)=>(String::new(),"unavailable",e),
  };
  let mut app=classify(if console{"ConsoleWindowClass"}else{class.as_str()},&exe);
@@ -595,7 +623,7 @@ fn inspect_app(d:&Dwm,h:H,explorer_only:bool,trace_focus:bool)->App{
   let title=if class=="SunAwtFrame"&&matches!(exe.as_str(),"java.exe"|"javaw.exe"){read_title(h).map(|t|String::from_utf16_lossy(&t)).unwrap_or_default()}else{String::new()};
   app=supplemental_app(&class,&exe,settings,&title);
  }
- if app==App::GenericProbe&&unsafe{GetAncestor(h,2)!=h||window_neighbor(h,4)!=0}{app=App::Other;}
+ if app==App::GenericProbe&&!settings_owner_allowed(matches!(class.as_str(),"ApplicationFrameWindow"|"Windows.UI.Core.CoreWindow")&&verified_settings_frame(h),unsafe{GetAncestor(h,2)==h},unsafe{window_neighbor(h,4)!=0}){app=App::Other;}
  if release::is_excluded(&exe,app,&class){log(&format!("config_excluded hwnd={h:#x} exe={exe}"));return App::Other;}
  if console{log(&format!("console_detect hwnd={h:#x} pid={pid} class={class} exe={exe:?} source={source} query_error={error} app={app:?}"));}
  if app!=App::Other||console||trace_focus{
@@ -632,7 +660,7 @@ struct Target{
  theme:Option<ThemeGuard>,title_cache:Option<(Layout,Vec<u16>)>,theme_failed:bool,
  title_dark:bool,explorer_fill:Option<u32>,band_attempt:Option<(Layout,bool)>,
  guard:Restore,gap:i32,top:i32,dpi:u32,last:Layout,shown:bool,
- last_zoom:bool,refresh:bool,misses:u32,hover:bool,
+ last_zoom:bool,refresh:bool,misses:u32,miss_since:Option<Instant>,hover:bool,
  ribbon_margin_preferred:bool,frame_extent:Option<(i32,i32)>,theme_due:Option<Instant>,zoom_repaint_due:Option<Instant>,ribbon_due:Option<Instant>,ribbon_check:Instant,ribbon_alt_key:Option<(Rect,Vec<u16>)>,ribbon_alt:Option<Layout>,ribbon_alt_due:Option<Instant>,ribbon_scan:custom_caption::RibbonScan,
 }
 impl Target{
@@ -657,13 +685,14 @@ impl Target{
   let hidden=d.rect(h,5).ok_or("Cannot verify stock button bounds")?;
   if style(h)&WS_CAPTION!=WS_CAPTION||hidden.right!=hidden.left{return Err("Native caption preservation or stock removal failed".into());}
   log(&format!("attach hwnd={h:#x} app={app:?} caption=true stock_width=0 original_bounds={b:?} gap={gap} top={top} maximized={}",IsZoomed(h)!=0));
-  Ok(Self{app,theme:None,title_cache:None,theme_failed:false,title_dark:false,explorer_fill:if app==App::Explorer{explorer_caption::choose_fill(h)}else{None},band_attempt:None,guard,gap,top,dpi,last:initial,shown:false,last_zoom:IsZoomed(h)!=0,refresh:true,misses:0,hover:false,ribbon_margin_preferred:false,frame_extent:None,theme_due:None,zoom_repaint_due:None,ribbon_due:None,ribbon_check:Instant::now(),ribbon_alt_key:None,ribbon_alt:None,ribbon_alt_due:None,ribbon_scan:custom_caption::RibbonScan::default()})
+  Ok(Self{app,theme:None,title_cache:None,theme_failed:false,title_dark:false,explorer_fill:if app==App::Explorer{explorer_caption::choose_fill(h)}else{None},band_attempt:None,guard,gap,top,dpi,last:initial,shown:false,last_zoom:IsZoomed(h)!=0,refresh:true,misses:0,miss_since:None,hover:false,ribbon_margin_preferred:false,frame_extent:None,theme_due:None,zoom_repaint_due:None,ribbon_due:None,ribbon_check:Instant::now(),ribbon_alt_key:None,ribbon_alt:None,ribbon_alt_due:None,ribbon_scan:custom_caption::RibbonScan::default()})
  }}
  fn needs_fast_tick(&self)->bool{!self.shown||self.refresh||self.misses>0||self.theme_due.is_some()||self.zoom_repaint_due.is_some()||self.ribbon_due.is_some()||self.ribbon_alt_due.is_some()}
  fn tick(&mut self,d:&Dwm,sprite:H,title_sprite:H,mode:u8,dark_text:bool, safe_zoom:bool,console_left:bool,native_left:bool)->Result<(),String>{unsafe{
   let h=self.guard.h;
   if !self.guard.alive()||!owner_presentable(d,h)||GetForegroundWindow()!=h{return Err("Target no longer active".into());}
-  if style(h)&(WS_CAPTION|BUTTON_BITS)!=WS_CAPTION{return Err("Application changed caption style".into());}
+  let caption_style=style(h)&(WS_CAPTION|BUTTON_BITS);
+  if caption_style!=WS_CAPTION{return Err((if caption_style==(WS_CAPTION|BUTTON_BITS){"Stock buttons returned after state change"}else{"Application changed caption style"}).into());}
   let zoom=IsZoomed(h)!=0;let was_zoom=self.last_zoom;
   if zoom!=self.last_zoom{log(&format!("state hwnd={h:#x} maximized={zoom}"));self.last_zoom=zoom;self.refresh=true;}
   let mut next=layout(d,h,self.gap,self.top,self.dpi).ok_or("Caption slot became invalid")?;
@@ -678,11 +707,12 @@ impl Target{
   let extent=frame.map(|r|(r.right-r.left,r.bottom-r.top));
   if extent!=self.frame_extent{
    if self.frame_extent.is_some(){self.theme_failed=false;}
-   if ribbon&&self.frame_extent.is_some(){self.ribbon_margin_preferred=false;self.ribbon_due=Some(Instant::now()+FRAME_SETTLE);self.theme_failed=false;self.ribbon_alt_key=None;self.ribbon_alt=None;self.ribbon_alt_due=None;}
+   if ribbon&&self.frame_extent.is_some(){self.ribbon_due=None;self.theme_failed=false;self.ribbon_alt_key=None;self.ribbon_alt=None;self.ribbon_alt_due=None;}
    if self.frame_extent.is_some()&&self.theme.is_some(){
-    if ribbon{self.theme.take();self.theme_failed=false;self.title_cache=None;self.theme_due=None;self.ribbon_due=Some(Instant::now()+FRAME_SETTLE);ShowWindow(title_sprite,0);log("native_left_recheck reason=ribbon_geometry_changed");}
-    else{self.theme_due=Some(Instant::now()+FRAME_SETTLE);}
+    if ribbon{self.theme_failed=false;self.title_cache=None;self.theme_due=None;self.ribbon_due=None;log("native_left_recheck reason=ribbon_geometry_changed_keep_theme");}
+    else if self.app!=App::Console{self.theme_due=Some(Instant::now()+FRAME_SETTLE);}
    }
+   if self.app==App::Console&&self.frame_extent.is_some(){self.zoom_repaint_due=Some(Instant::now()+FRAME_SETTLE);}
    self.frame_extent=extent;
   }
   let slot_frame=if zoom{frame.zip(monitor_info(h)).map(|(r,m)|Rect{left:r.left.max(m.work.left),top:r.top.max(m.work.top),right:r.right.min(m.work.right),bottom:r.bottom.min(m.work.bottom)})}else{frame};
@@ -716,11 +746,13 @@ impl Target{
       self.ribbon_check=Instant::now();
       // During a geometry recheck our previous dots must not contaminate
       // the ownership/color probe. Re-present the same session after verification.
-      if IsWindowVisible(sprite)!=0{ShowWindow(sprite,0);self.shown=false;self.refresh=true;}
+      let same_left=self.shown&&self.last==left&&IsWindowVisible(sprite)!=0;
+      if !same_left&&IsWindowVisible(sprite)!=0{ShowWindow(sprite,0);self.shown=false;self.refresh=true;}
       if IsWindowVisible(title_sprite)!=0{ShowWindow(title_sprite,0);}
-      let mut left_ok=custom_caption::blank_caption(h,left);
+      let mut left_ok=if same_left{custom_caption::caption_hits(h,left)}else{custom_caption::blank_caption(h,left)};
       if !left_ok&&!self.ribbon_margin_preferred&&GetForegroundWindow()==h{
        if let Some(r)=slot_frame{
+        if IsWindowVisible(sprite)!=0{ShowWindow(sprite,0);self.shown=false;self.refresh=true;}
         let alternate=Layout{pos:Point{x:ribbon_left_x(r.left,next.dpi,true),y:left.pos.y},..left};
         if custom_caption::blank_caption(h,alternate){left=alternate;left_ok=true;self.ribbon_margin_preferred=true;log(&format!("native_left_margin_fallback hwnd={h:#x} preferred_dip=8 alternate_dip=13"));}
        }
@@ -730,6 +762,7 @@ impl Target{
       left_ok&&center_ok
      }else if self.ribbon_check.elapsed()>=Duration::from_millis(400){self.ribbon_check=Instant::now();custom_caption::caption_hits(h,left)&&custom_caption::caption_hits(h,center)}else{true};
      if !ribbon_clear{
+      if GetForegroundWindow()!=h{return Err("Focus changed before present".into());}
       self.theme.take();self.theme_failed=true;ShowWindow(title_sprite,0);self.title_cache=None;
       log(&format!("native_left_skip hwnd={h:#x} app={:?} reason=ribbon_slot_not_verified",self.app));
      }else{
@@ -777,7 +810,7 @@ impl Target{
      self.ribbon_alt_due=Some(Instant::now()+FRAME_SETTLE);self.ribbon_scan=custom_caption::RibbonScan::default();
     }
     if self.ribbon_alt_due.map_or(false,|due|Instant::now()>=due){
-     let (slot,done)=self.ribbon_scan.step(h,next,r,info.work,true);
+     let (slot,done)=self.ribbon_scan.step_native_edge(h,next,r,info.work);
      self.ribbon_alt_due=if done{None}else{Some(Instant::now()+Duration::from_millis(40))};
      self.ribbon_alt=slot;
      self.ribbon_check=Instant::now();
@@ -796,7 +829,7 @@ impl Target{
   // One follow-up invalidation only, after the geometry/theme settle.
   if self.zoom_repaint_due.map_or(false,|due|Instant::now()>=due){
    self.zoom_repaint_due=None;
-   zoom_repaint(h,false);
+   if self.app==App::Console{let ok=RedrawWindow(h,null(),0,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN)!=0;log(&format!("console_client_repaint hwnd={h:#x} ok={ok}"));}else{zoom_repaint(h,false);}
   }
   let resized=next.w!=self.last.w||next.h!=self.last.h||next.dpi!=self.last.dpi;
   let moved=next!=self.last;
@@ -815,9 +848,9 @@ impl Target{
   self.last=next;
   let center=Point{x:next.pos.x+scale(11,next.dpi),y:next.pos.y+scale(11,next.dpi)};
   let hit=WindowFromPoint(center);
-  if hit==sprite{if self.misses>0{log(&format!("sprite_hit_recovered retries={}",self.misses));}self.misses=0;}
-  else{self.misses+=1;if self.misses==1{log(&format!("sprite_hit_miss hwnd={hit:#x} target={h:#x}"));}
-   if self.misses>=15{return Err("Caption popup remained covered; restoring stock".into());}
+  if hit==sprite{if self.misses>0{log(&format!("sprite_hit_recovered retries={}",self.misses));}self.misses=0;self.miss_since=None;}
+  else{self.misses=self.misses.saturating_add(1);if self.misses==1{log(&format!("sprite_hit_miss hwnd={hit:#x} target={h:#x}"));}
+   if coverage_expired(&mut self.miss_since,Instant::now()){return Err("Caption popup remained covered; restoring stock".into());}
    if self.misses==3||self.misses==8{self.refresh=true;}
   }
   Ok(())
@@ -910,7 +943,7 @@ fn transient_native_geometry(reason:&str)->bool{matches!(reason,
 // block after a temporary geometry failure, and no tight retry for access/style errors.
 fn recovery_delay(attempt:&mut usize)->(Duration,bool){
  let n=*attempt;
- let ms=[80,160,320,640,1000].get(n).copied().unwrap_or(1500);
+ let ms=[30,80,160,320,640,1000].get(n).copied().unwrap_or(1500);
  *attempt=n.saturating_add(1);
  (Duration::from_millis(ms),n<=5)
 }
@@ -921,7 +954,7 @@ fn arm_geometry_retry(h:H,app:App,attempt:&mut usize,reason:&str)->Option<Instan
  Some(Instant::now()+delay)
 }
 #[cfg(test)] mod recovery_tests{use super::*;
- #[test]fn geometry_retry_recovers_after_budget(){let mut n=0;for ms in [80,160,320,640,1000,1500,1500,1500]{assert_eq!(recovery_delay(&mut n).0,Duration::from_millis(ms));}assert!(transient_native_geometry("Caption popup remained covered; restoring stock"));assert!(!transient_native_geometry("Style change failed"));}
+ #[test]fn geometry_retry_recovers_after_budget(){let mut n=0;for ms in [30,80,160,320,640,1000,1500,1500]{assert_eq!(recovery_delay(&mut n).0,Duration::from_millis(ms));}assert!(transient_native_geometry("Caption popup remained covered; restoring stock"));assert!(!transient_native_geometry("Style change failed"));}
  #[test]fn retry_only_for_admitted_native(){let mut n=0;assert!(arm_geometry_retry(0,App::Other,&mut n,"Invalid initial slot").is_none());assert!(arm_geometry_retry(0,App::Explorer,&mut n,"Style change failed").is_none());assert_eq!(n,0);}
 }
 #[cfg(test)] mod explorer_startup_tests{
@@ -958,7 +991,7 @@ fn centered_generic_class(class:&str)->bool{
 impl Session{
  fn new(h:H,app:App,name:&[u16],inst:H,office_exact:bool,browser_left:bool,browser_spacer:bool)->Option<Self>{unsafe{
   let make=|ex|Sprite(CreateWindowExW(ex,name.as_ptr(),name.as_ptr(),0x80000000,0,0,1,1,h,0,inst,null()));
-  let need_title=app.needs_title_surface(office_exact);
+  let need_title=app.needs_title_surface(office_exact)||(app==App::BrowserProbe&&read_title(h).as_deref().is_some_and(custom_caption::browser_plain_title));
   let need_cover=app.probe();
   let cover=if need_cover{make(0x08080080)}else{Sprite(0)};
   let title=if need_title{make(0x080800a0)}else{Sprite(0)};
@@ -1131,7 +1164,7 @@ fn run()->Result<(),String>{unsafe{
    }
    tray.refresh();wake_manager();continue;
   }
-  if tray_cmd!=0{if let Err(e)=release::menu_action(tray_cmd){log(&format!("tray_action_error {e}"));MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic 1.0.2").as_ptr(),0x30);}continue;}
+  if tray_cmd!=0{if let Err(e)=release::menu_action(tray_cmd){log(&format!("tray_action_error {e}"));MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic 1.0.3").as_ptr(),0x30);}continue;}
   if m.message==release::TRAY_MESSAGE&&m.hwnd==manager.0{continue;}
   if m.message==0x0312&&release::PAUSED.load(std::sync::atomic::Ordering::Relaxed){continue;}
   if let Some((key,label))=if m.message==0x0312{layout_key(m.wparam)}else{None}{
@@ -1160,12 +1193,10 @@ fn run()->Result<(),String>{unsafe{
    let background_pass=focus_changed||flags&(DIRTY_ENVIRONMENT|DIRTY_VISIBILITY)!=0||Instant::now()>=background_due||(background_dirty&&background_last.elapsed()>=Duration::from_millis(80));
    if background_pass{
     background_dirty=false;background_last=Instant::now();background_passes+=1;background_due=background_last+background_period;
-    zooms.retain(|&h,z|zoom_alive(h,*z)&&(IsIconic(h)!=0||zoom_matches(h,*z)));
-    sessions.retain(|_,s|s.alive());reconcile_tracked(&sessions);
    }
    if fg!=foreground{
     foreground=fg;foreground_app=sessions.get(&fg).map(|s|s.app).unwrap_or_else(||inspect_app(&d,fg,explorer_only,trace_focus));
-    if let Some(s)=sessions.get_mut(&fg){s.rearm();s.custom.resume();
+    if let Some(s)=sessions.get_mut(&fg){s.rearm();s.custom.resume();if s.app==App::OfficeProbe&&custom_left&&mode==2{s.custom.rearm_office();}if let Some(t)=s.active.as_mut(){t.misses=0;t.miss_since=None;t.refresh=true;}
      if let Some(t)=s.active.as_mut(){if t.app==App::Explorer&&owner_presentable(&d,fg){
       let fill=explorer_caption::choose_fill(fg);
       if t.explorer_fill!=fill{t.explorer_fill=fill;t.band_attempt=None;t.title_cache=None;t.refresh=true;}
@@ -1179,11 +1210,12 @@ fn run()->Result<(),String>{unsafe{
     inspect_due=None;
     if foreground_app==App::Other&&maybe_new_caption(fg){foreground_app=inspect_app(&d,fg,explorer_only,trace_focus);if foreground_app==App::GenericProbe{log(&format!("generic_startup_admitted hwnd={fg:#x} attempts={inspect_attempt}"));}if foreground_app==App::Other{inspect_due=caption_retry_delay(fg,&mut inspect_attempt).map(|delay|Instant::now()+delay);}}
    }
-   if background_pass{
-    let fr=if owner_presentable(&d,fg){visible_rect(&d,fg)}else{None};
-    for (&h,s) in sessions.iter_mut(){if h!=fg{s.background(&d);s.audit_stack(fg,fr);}}
-   }
    let admitted=foreground_app.supported(explorer_only)||(foreground_app==App::BrowserProbe&&browser_enabled)||(foreground_app==App::OfficeProbe&&office_enabled)||(foreground_app==App::GenericProbe&&!explorer_only);
+   if admitted&&owner_presentable(&d,fg)&&!sessions.contains_key(&fg)&&sessions.len()>=MAX_SESSIONS{
+    sessions.retain(|_,s|s.alive());
+    if sessions.len()>=MAX_SESSIONS{if let Some(old)=sessions.keys().copied().find(|&h|h!=fg&&!owner_presentable(&d,h)){sessions.remove(&old);log(&format!("session_capacity_reclaim hwnd={old:#x}"));}}
+    reconcile_tracked(&sessions);
+   }
    if admitted&&owner_presentable(&d,fg)&&!sessions.contains_key(&fg)&&sessions.len()<MAX_SESSIONS{
     if let Some(s)=Session::new(fg,foreground_app,&name,inst,office_exact,browser_left,browser_spacer){sessions.insert(fg,s);track_window(fg);}
    }
@@ -1219,6 +1251,12 @@ fn run()->Result<(),String>{unsafe{
      }
     }else{s.suspend_surfaces("foreground_not_presentable");}
    }
+   if background_pass&&GetForegroundWindow()==fg{
+    zooms.retain(|&h,z|zoom_alive(h,*z)&&(IsIconic(h)!=0||zoom_matches(h,*z)));
+    sessions.retain(|_,s|s.alive());reconcile_tracked(&sessions);
+    let fr=if owner_presentable(&d,fg){visible_rect(&d,fg)}else{None};
+    for (&h,s) in sessions.iter_mut(){if h!=fg{s.background(&d);s.audit_stack(fg,fr);}}
+   }
    let settling=focus_changed||background_dirty||Instant::now()<fast_until||inspect_due.is_some()||sessions.get(&fg).is_some_and(|s|s.needs_fast_tick(custom_left&&mode==2));
    let wanted=interval_ms(hooks_complete,admitted,settling,!sessions.is_empty());
    if wanted!=tick_ms&&SetTimer(manager.0,1,wanted,0)!=0{tick_ms=wanted;}
@@ -1246,7 +1284,15 @@ fn run()->Result<(),String>{unsafe{
        if ok{s.close_cooldown=Some(Instant::now()+Duration::from_millis(750));}
        log(&format!("close_requested_keep_caption hwnd={h:#x} posted={ok}"));
       }else{zooms.remove(&h);s.custom.clear(s.sprite.0,s.cover.0);s.custom.block_close(h);PostMessageW(h,0x0010,0,0);}
-     },1=>{s.suspend_surfaces("minimize_requested");s.close_cooldown=Some(Instant::now()+Duration::from_millis(250));ShowWindowAsync(h,6);},2=>{let managed=zooms.contains_key(&h);if !(managed||use_workzoom)||!toggle_work_zoom(&d,h,&mut zooms,legacy_copy,false){ShowWindowAsync(h,if IsZoomed(h)!=0{9}else{3});}},_=>{}}
+     },1=>{s.suspend_surfaces("minimize_requested");s.close_cooldown=Some(Instant::now()+Duration::from_millis(250));ShowWindowAsync(h,6);},2=>{
+      let managed=zooms.contains_key(&h);let office=s.app==App::OfficeProbe;
+      let maximized=IsZoomed(h)!=0;let info=monitor_info(h);let reserved=info.as_ref().is_some_and(|i|i.work.top>i.monitor.top);
+      if office{if let Some(i)=info{log(&format!("office_zoom_request hwnd={h:#x} native_maximized={maximized} monitor={:?} work={:?} reserved_top={reserved}",i.monitor,i.work));}}
+      if !(managed||use_workzoom)||!toggle_work_zoom(&d,h,&mut zooms,legacy_copy,false){
+       if custom_zoom_native_fallback(office,use_workzoom,reserved,maximized){ShowWindowAsync(h,if maximized{9}else{3});}
+       else{log(&format!("office_zoom_native_fallback_blocked hwnd={h:#x} reason=reserved_top"));}
+      }
+     },_=>{}}
      signal(DIRTY_MOTION);continue;
     }
     let role=s.active.as_ref().and_then(|t|if t.shown&&t.guard.alive(){button_role(t.last,(m.lparam as u16 as i16) as i32,((m.lparam>>16) as u16 as i16) as i32)}else{None});
@@ -1256,9 +1302,9 @@ fn run()->Result<(),String>{unsafe{
      match i{
       0=>{let ok=PostMessageW(h,0x0010,0,0)!=0;if ok{s.close_cooldown=Some(Instant::now()+Duration::from_millis(750));}log(&format!("close_requested_keep_caption hwnd={h:#x} posted={ok}"));},
       1=>{s.suspend_surfaces("minimize_requested");s.close_cooldown=Some(Instant::now()+Duration::from_millis(250));ShowWindowAsync(h,6);},
-      2=>{let managed=zooms.contains_key(&h);let console=t.app==App::Console;let eligible=use_workzoom&&((mode==2&&t.last.left_slot)||console||(native_left&&matches!(t.app,App::Notepad|App::Paint|App::WordPad)));
-       if managed||eligible{if toggle_work_zoom(&d,h,&mut zooms,legacy_copy,console){t.refresh=true;t.misses=0;if t.theme.is_some(){t.theme_due=Some(Instant::now()+FRAME_SETTLE);}if !legacy_copy{t.zoom_repaint_due=Some(Instant::now()+FRAME_SETTLE);}}else{ShowWindowAsync(h,if IsZoomed(h)!=0{9}else{3});}}
-       else{ShowWindowAsync(h,if IsZoomed(h)!=0{9}else{3});}
+      2=>{let managed=zooms.contains_key(&h);let console=t.app==App::Console;let eligible=use_workzoom&&!console&&((mode==2&&t.last.left_slot)||(native_left&&matches!(t.app,App::Notepad|App::Paint|App::WordPad)));
+       if managed||eligible{if toggle_work_zoom(&d,h,&mut zooms,legacy_copy,console){t.refresh=true;t.misses=0;t.miss_since=None;if t.theme.is_some()&&!matches!(t.app,App::Paint|App::WordPad|App::Console){t.theme_due=Some(Instant::now()+FRAME_SETTLE);}if !legacy_copy{t.zoom_repaint_due=Some(Instant::now()+FRAME_SETTLE);}}else{ShowWindowAsync(h,if IsZoomed(h)!=0{9}else{3});}}
+       else{ShowWindowAsync(h,if IsZoomed(h)!=0{9}else{3});if console{t.zoom_repaint_due=Some(Instant::now()+FRAME_SETTLE);}}
       },_=>{}
      }
     }
@@ -1277,7 +1323,7 @@ fn run()->Result<(),String>{unsafe{
  custom_caption::shutdown_workers();
  drop(tray);drop(manager);result
 }}
-fn main(){let result=release::init().and_then(|_|{log(&format!("=== MacTraffic v1.0.2 pid={} ===",std::process::id()));run()});if let Err(e)=result{log(&format!("stop error: {e}"));unsafe{MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic v1.0.2").as_ptr(),0x30);}}}
+fn main(){let result=release::init().and_then(|_|{log(&format!("=== MacTraffic v1.0.3 pid={} ===",std::process::id()));run()});if let Err(e)=result{log(&format!("stop error: {e}"));unsafe{MessageBoxW(0,wide(&e).as_ptr(),wide("MacTraffic v1.0.3").as_ptr(),0x30);}}}
 
 #[cfg(test)] mod performance_tests{use super::*;
  #[test] fn overlap_is_strict(){let a=Rect{left:0,top:0,right:80,bottom:30};assert!(overlaps(a,Rect{left:79,..a}));assert!(!overlaps(a,Rect{left:80,right:100,..a}));assert!(!overlaps(a,Rect{top:30,bottom:60,..a}));}
@@ -1304,4 +1350,9 @@ fn main(){let result=release::init().and_then(|_|{log(&format!("=== MacTraffic v
 #[cfg(test)] mod visibility_hotfix_tests{use super::*;
  #[test] fn hidden_or_minimized_owner_is_not_presentable(){assert!(!visibility_allowed(false,false));assert!(!visibility_allowed(false,true));}
  #[test] fn cloaked_owner_is_not_presentable(){assert!(!visibility_allowed(true,true));assert!(visibility_allowed(true,false));}
+}
+
+#[cfg(test)] mod hotfix103_tests{use super::*;
+ #[test]fn event_bursts_do_not_expire_coverage(){let now=Instant::now();let mut since=None;for _ in 0..100{assert!(!coverage_expired(&mut since,now));}assert!(!coverage_expired(&mut since,now+Duration::from_millis(649)));assert!(coverage_expired(&mut since,now+Duration::from_millis(650)));}
+ #[test]fn settings_ownership_stays_identity_gated(){assert!(settings_owner_allowed(true,true,true));assert!(!settings_owner_allowed(false,true,true));assert!(!settings_owner_allowed(true,false,false));assert!(settings_owner_allowed(false,true,false));}
 }

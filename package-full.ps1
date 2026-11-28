@@ -12,13 +12,13 @@ $stage = Join-Path $PWD 'dist-full'
 if (Test-Path -LiteralPath $stage) { throw 'dist-full already exists. Move it aside before rebuilding to preserve its configuration.' }
 New-Item -ItemType Directory -Path $stage | Out-Null
 # Copy clean templates rather than a potentially user-edited dist INI.
-Copy-Item -LiteralPath 'dist\MacTraffic.exe','MacTraffic.ini','Spacer.html','README.md','EXPLORER-BLUR.md','CLEAN-INSTALL.md' -Destination $stage
+Copy-Item -LiteralPath 'dist\MacTraffic.exe','MacTraffic.ini','Spacer.html','README.md','EXPLORER-BLUR.md','CLEAN-INSTALL.md','Setup-Blur.ps1' -Destination $stage
 $provider = Join-Path $stage 'blur-provider'
 New-Item -ItemType Directory -Path $provider | Out-Null
 Copy-Item -LiteralPath $dll,'blur-provider\config.ini','blur-provider\Manage-Blur.ps1','blur-provider\LICENSE','blur-provider\COPYING.LESSER','blur-provider\README.md','blur-provider\UPSTREAM-README.txt' -Destination $provider
-$archive = Join-Path $PWD 'release\MacTraffic-v1.0.2-full-win-x64.zip'
+$archive = Join-Path $PWD 'release\MacTraffic-v1.0.3-full-win-x64.zip'
 Compress-Archive -Path "$stage\*" -DestinationPath $archive -Force
-$names = @('MacTraffic-v1.0.2-win-x64.zip','MacTraffic-v1.0.2-full-win-x64.zip')
+$names = @('MacTraffic-v1.0.3-win-x64.zip','MacTraffic-v1.0.3-full-win-x64.zip')
 $sha = [System.Security.Cryptography.SHA256]::Create()
 try {
     $names | ForEach-Object {

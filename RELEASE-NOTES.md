@@ -1,30 +1,21 @@
-## MacTraffic v1.0.2 — Full & Core
+# MacTraffic v1.0.3 — Caption Stability Hotfix
 
-Native Rust window controls with an optional bundled Explorer Acrylic blur companion.
+Release candidate until Windows desktop acceptance.
 
-### Changes
-- Improved Explorer caption background handling and focus recovery.
-- Stable per-user browser Spacer file for Brave and Edge.
-- Optional bundled ExplorerBlurMica companion in the Full package.
-- Portable Core and Full downloads with SHA-256 checksums.
+- Foreground-first rendering and immediate refresh of verified sessions.
+- Preserve Ribbon theme across resizing; verify edge slots and avoid scanning distant title positions.
+- Use elapsed-time cover recovery to avoid premature resets during event bursts.
+- Retain verified custom caption surfaces on temporary color sampling failures; update generic title text in place.
+- Admit verified owned Settings frames, including supported deep-link launches.
+- Classic console native maximize and one deferred client invalidation after resize.
+- Preserve the optional Explorer blur provider and stable browser Spacer.
+- Include Setup-Blur.ps1 in the Full ZIP.
+- Fix E0133 in the Settings admission path.
+- Office document launch: native role verification fallback, strict same-process owned Office frame admission, transient-title handling and bounded left-slot revalidation.
+- Prevent native maximize fallback for Office when the top work area is reserved and work-area zoom is enabled. Native restore remains available.
 
-### Downloads
-- **Full**: `MacTraffic-v1.0.2-full-win-x64.zip` — includes optional Explorer blur.
-- **Core**: `MacTraffic-v1.0.2-win-x64.zip` — caption manager only.
+## Installation
 
-### Quick start (Windows 10 x64)
-Extract into a permanent folder. Exit older MacTraffic versions with Ctrl+Alt+F12, then run `MacTraffic.exe`. No compiler or Rust installation is needed.
+Existing v1.0.2 Full users may replace only MacTraffic.exe after normal exit and preserve the registered provider, configuration and Spacer. New users can extract Full, run Setup-Blur.ps1 if blur is desired, restart Windows and open MacTraffic.exe. See README for disable/uninstall instructions.
 
-**For Explorer blur (Full only):** exit MacTraffic, open 64-bit Windows PowerShell as Administrator in the extracted `blur-provider` folder and run:
-
-```powershell
-.\Manage-Blur.ps1 -Action Enable
-```
-
-Confirm with `YES` and restart Windows. This is a one-time setup requiring explicit COM registration; do not move or delete the registered provider folder. To remove blur, use `-Action Disable` from the same folder, then restart Windows before deleting it. If you already have another ExplorerBlurMica installation, uninstall it using its own uninstaller first.
-
-**Brave / Edge:** open the stable Spacer folder from the tray. Pin three Spacer tabs in Brave or two in Edge at the far left; close any obsolete Spacer tabs first.
-
-**Controls:** Ctrl+Alt+P to pause/resume; Ctrl+Alt+F12 to exit and restore. Startup is optional through the tray.
-
-See the [full installation and removal guide](https://github.com/minhphuocit/MacTraffic-Native#download-and-install). CI passed; desktop behavior can vary by Windows build and application. The optional blur companion is derived from Maplespe/ExplorerBlurMica (LGPLv3 notices retained).
+Windows build, unit tests and actual desktop checks must pass before publishing. Safe fallback remains intentional where title-bar geometry cannot be verified.

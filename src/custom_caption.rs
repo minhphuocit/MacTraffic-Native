@@ -23,7 +23,7 @@ pub(super) fn poll(req:Request,trace:bool)->Option<Rect>{
                 let mut uia=UiaWorker::new("caption");
                 while let Ok((r,t))=rx.recv(){
                     let started=Instant::now();
-                    let value=unsafe{if r.browser||r.native_probe { quick_generic_hint(r).or_else(||verified_native(r)).or_else(||verified_dwm_hint(r)).or_else(||verified_hit_strip(r,t)).or_else(||query(r,t,&mut uia)) } else {query(r,t,&mut uia)}};
+                    let value=unsafe{if r.browser||r.native_probe { quick_generic_hint(r).or_else(||verified_native(r)).or_else(||verified_dwm_hint(r)).or_else(||verified_hit_strip(r,t)).or_else(||query(r,t,&mut uia)) } else {verified_native(r).or_else(||query(r,t,&mut uia)).or_else(||verified_dwm_hint(r))}};
                     if t{log(&format!("custom_probe_complete hwnd={:#x} browser={} generic={} elapsed_ms={} verified={}",r.hwnd,r.browser,r.native_probe,started.elapsed().as_millis(),value.is_some()));}
                     if out.send((r,value)).is_err(){break;}
                     wake_manager();
@@ -79,7 +79,8 @@ unsafe fn element_at(a:&Com,p:Point,req:Request,free:Free,len:Len,trace:bool)->O
     let enabled:unsafe extern "system" fn(P,*mut i32)->i32=std::mem::transmute(slot(el.0,28));
     let mut is_enabled=0;if enabled(el.0,&mut is_enabled)<0||is_enabled==0{return None;}
     let bounds:unsafe extern "system" fn(P,*mut Rect)->i32=std::mem::transmute(slot(el.0,43));
-    let(mut pid,mut kind)=(0,0);if process(el.0,&mut pid)<0||pid as u32!=req.pid||control(el.0,&mut kind)<0||kind!=50000{return None;}
+    let(mut pid,mut kind)=(0,0);if process(el.0,&mut pid)<0||pid<=0||control(el.0,&mut kind)<0||kind!=50000{return None;}
+    if pid as u32!=req.pid&&!(req.native_probe&&verified_settings_uia_pid(req.hwnd,pid as u32)){return None;}
     let mut text=null_mut();let hr=name(el.0,&mut text);if text.is_null(){return None;}
     let n=len(text) as usize;let label=if hr>=0&&n<=128{String::from_utf16_lossy(std::slice::from_raw_parts(text,n))}else{String::new()};free(text);
     let mut r=Rect::default();if bounds(el.0,&mut r)<0{return None;}
@@ -337,6 +338,27 @@ fn generic_visual_envelope(verified:Rect,hint:Option<Rect>,frame:Rect,work:Rect,
  let full=union(b,verified);
  candidate_layout(full,frame,work,dpi)?;Some(full)
 }
+// The profile picker uses a classic nonclient title bar, unlike Chromium tabs.
+// Exact product title is only a hint: the live client origin must be below
+// a native caption. Never apply the centered profile to an ordinary tab strip.
+pub(super) fn browser_plain_title(title:&[u16])->bool{
+ ["Brave","Google Chrome","Microsoft Edge"].iter().any(|name|title.iter().copied().eq(name.encode_utf16()))
+}
+fn plain_browser_native(h:H,frame:Rect,dpi:u32,title:Option<&[u16]>)->bool{unsafe{
+ if !title.is_some_and(browser_plain_title)||style(h)&WS_CAPTION!=WS_CAPTION{return false;}
+ let mut origin=Point::default();let mut client=Rect::default();
+ GetClientRect(h,&mut client)!=0&&client.width()>0&&client.height()>0&&ClientToScreen(h,&mut origin)!=0&&origin.y>=frame.top+scale(18,dpi)&&origin.y<=frame.top+scale(64,dpi)
+}}
+fn plain_browser_cover(verified:Rect,hint:Option<Rect>,frame:Rect,work:Rect,dpi:u32,client_top:i32)->Option<Rect>{
+ // The whole DWM envelope must agree with the verified live role group.
+ let raw=hint?;
+ let b=Rect{left:raw.left.max(frame.left).max(work.left),top:raw.top.max(frame.top).max(work.top),right:raw.right.min(frame.right).min(work.right),bottom:raw.bottom.min(frame.bottom).min(work.bottom)};
+ candidate_layout(b,frame,work,dpi)?;
+ if b.width()<scale(90,dpi)||frame.right-b.right>scale(12,dpi)||b.bottom>client_top{return None;}
+ let full=generic_visual_envelope(verified,Some(raw),frame,work,dpi)?;
+ if full.left>b.left||full.right<b.right||full.top>b.top||full.bottom<b.bottom||full.bottom>client_top{return None;}
+ Some(full)
+}
 fn candidate_layout(r:Rect,frame:Rect,work:Rect,dpi:u32)->Option<Layout>{
  let w=r.width();let h=r.height();
  if dpi>480||w<scale(66,dpi)||w>scale(220,dpi)||h<scale(18,dpi)||h>scale(56,dpi)||r.left<frame.left+scale(100,dpi)||r.right>frame.right||r.top<frame.top||r.bottom>frame.bottom||r.bottom>frame.top+scale(64,dpi){return None;}
@@ -376,6 +398,14 @@ const NATIVE_OFFSETS:[i32;30]=[3,8,24,40,56,72,80,88,104,112,120,136,144,152,168
 #[derive(Clone,Copy,Debug,Default)]
 pub(super) struct RibbonScan{index:usize}
 impl RibbonScan{
+ pub(super) fn step_native_edge(&mut self,h:H,right:Layout,frame:Rect,work:Rect)->(Option<Layout>,bool){
+  const SLOTS:[(i32,i32);6]=[(8,4),(8,0),(8,2),(3,4),(3,0),(3,2)];
+  let Some(&(offset,dy))=SLOTS.get(self.index)else{return (None,true);};
+  if unsafe{GetForegroundWindow()}!=h{return (None,false);}
+  self.index+=1;
+  let slot=ribbon_candidate(right,frame,work,offset).and_then(|l|shift_ribbon(l,frame,work,dy)).filter(|l|blank_caption(h,*l));
+  (slot,slot.is_some()||self.index>=SLOTS.len())
+ }
  pub(super) fn step(&mut self,h:H,right:Layout,frame:Rect,work:Rect,native:bool)->(Option<Layout>,bool){
   let total=if native{NATIVE_OFFSETS.len()*3}else{OFFICE_OFFSETS.len()*3};
   if self.index>=total{return (None,true);}
@@ -514,6 +544,11 @@ fn shifted_pixels(source:&[u32],width:usize,height:usize,delta:usize)->Option<Ve
  }
  Some(out)
 }
+fn office_exact_edge(slot:Layout,frame:Rect,work:Rect)->bool{
+ let offset=slot.pos.x-frame.left.max(work.left);
+ offset==scale(LEFT_MARGIN_DIP,slot.dpi)||offset==scale(3,slot.dpi)
+}
+fn centered_profile_wait(settings:bool,age:Duration)->bool{!settings||age<Duration::from_millis(400)}
 fn make_office_shift(h:H,slot:Layout,right:Layout,frame:Rect,work:Rect)->Result<(Layout,OfficeShift),&'static str>{
  // Prefer 8 DIP. Only extend into additional pixels if their hit region
  // and color are verified; otherwise retain the user-tested 3 DIP layout.
@@ -524,7 +559,7 @@ fn make_office_shift_inner(h:H,slot:Layout,right:Layout,frame:Rect,work:Rect,pad
  let start=frame.left.max(work.left)+scale(3,slot.dpi);
  let prefix=slot.pos.x-start;
  let extended=Layout{w:slot.w+pad,..slot};
- if prefix<scale(12,slot.dpi)||prefix>scale(300,slot.dpi){return Err("prefix_bounds");}
+ if prefix<scale(12,slot.dpi)||prefix>scale(1200,slot.dpi)||prefix+extended.w>1600{return Err("prefix_bounds");}
  let buttons=Layout{pos:Point{x:start+pad,y:slot.pos.y},..slot};
  // Keep away from the outer resize border, but include the full visible glyphs.
  let top=right.pos.y+scale(4,slot.dpi);
@@ -536,6 +571,47 @@ fn make_office_shift_inner(h:H,slot:Layout,right:Layout,frame:Rect,work:Rect,pad
  if !owned_ribbon(h,strip){return Err("prefix_focus_changed");}
  let pixels=shifted_pixels(&pixels,strip.w as usize,strip.h as usize,extended.w as usize).ok_or("expanded_slot_nonflat")?;
  Ok((buttons,OfficeShift{layout:strip,pixels,original_slot:extended}))
+}
+// Read a bounded title stripe once per row. Reject occupied pixels before
+// expensive cross-process hit tests; never accept a middle-position sprite.
+fn flat_window_in_strip(pixels:&[u32],stride:usize,height:usize,x:usize,width:usize)->bool{
+ if width<3||height<3||x.checked_add(width).is_none_or(|end|end>stride)||pixels.len()!=stride*height{return false;}
+ for row in pixels.chunks_exact(stride){let part=&row[x..x+width];let base=part[1];
+  if part[1..width-1].iter().any(|&c|[0,8,16].into_iter().any(|shift|((c>>shift)&255).abs_diff((base>>shift)&255)>16)){return false;}
+ }
+ true
+}
+fn office_exact_row(h:H,right:Layout,frame:Rect,work:Rect,dy:i32)->Option<(Layout,Option<OfficeShift>)>{
+ let d=right.dpi;let start=frame.left.max(work.left);let end=frame.right.min(work.right);
+ let y=right.pos.y+(right.h-scale(22,d))/2+scale(dy,d);let w=scale(66,d);let height=scale(22,d);
+ let limit=(start+(end-start)*45/100).min(right.pos.x-scale(12,d)).min(end).min(start+scale(1200,d)).min(start+1536);
+ let stripe=Layout{pos:Point{x:start+scale(3,d),y},w:limit-start-scale(3,d),h:height,left_slot:true,..right};
+ if stripe.w<w||y<right.pos.y||y+height>right.pos.y+right.h||y<frame.top.max(work.top)||y+height>frame.bottom.min(work.bottom)||!owned_ribbon(h,stripe){return None;}
+ let pixels=read_local_pixels(stripe).ok()?;
+ if unsafe{GetForegroundWindow()}!=h{return None;}
+ // Try the exact edge first. Then test the beginning of each sufficiently
+ // wide flat run (and a second nearby inset), not dozens of overlapping slots.
+ let mut offsets=vec![LEFT_MARGIN_DIP,3];let mut last_gap=None;let mut was_flat=false;
+ for offset in (24..=1200).step_by(4){
+  let x=scale(offset,d)-scale(3,d);if x+w>stripe.w{break;}
+  let flat=flat_window_in_strip(&pixels,stripe.w as usize,height as usize,x as usize,w as usize);
+  if flat&&(!was_flat||last_gap.is_some_and(|last|offset-last>=24)){
+   offsets.push(offset);last_gap=Some(offset);if offsets.len()>=12{break;}
+  }
+  was_flat=flat;
+ }
+ let deadline=Instant::now()+Duration::from_millis(180);let mut proofs=0;
+ for offset in offsets{
+  if Instant::now()>=deadline||unsafe{GetForegroundWindow()}!=h{break;}
+  let Some(slot)=ribbon_candidate(right,frame,work,offset).and_then(|l|shift_ribbon(l,frame,work,dy))else{continue;};
+  let x=slot.pos.x-stripe.pos.x;if x<0||!flat_window_in_strip(&pixels,stripe.w as usize,height as usize,x as usize,w as usize){continue;}
+  if office_blank_caption(h,slot).is_err(){continue;}
+  if office_exact_edge(slot,frame,work){return Some((slot,None));}
+  proofs+=1;
+  if let Ok((exact,shift))=make_office_shift(h,slot,right,frame,work){return Some((exact,Some(shift)));}
+  if proofs>=3{break;}
+ }
+ None
 }
 pub(super) fn blank_caption(h:H,l:Layout)->bool{blank_caption_result(h,l).is_ok()}
 fn blank_caption_result(h:H,l:Layout)->Result<(),&'static str>{
@@ -607,6 +683,14 @@ fn centered_button_hits(h:H,l:Layout)->bool{unsafe{
  let start=Instant::now();
  (0..3).all(|i|GetForegroundWindow()==h&&start.elapsed()<Duration::from_millis(20)&&matches!(hit_code_with_timeout(h,Point{x:l.pos.x+scale(11+i*22,l.dpi),y:l.pos.y+l.h/2},5),Some(2)|Some(3)))
 }}
+// None denotes a temporary timeout, not a proven occupied hit region.
+fn settings_left_roles(h:H,l:Layout)->Option<bool>{unsafe{
+ for i in 0..3{
+  if GetForegroundWindow()!=h{return None;}
+  match hit_code_with_timeout(h,Point{x:l.pos.x+scale(11+i*22,l.dpi),y:l.pos.y+l.h/2},5){Some(2)|Some(3)=>{},Some(_)=>return Some(false),None=>return None}
+ }
+ Some(true)
+}}
 // Settings uses an extended client frame. The DWM button envelope is still
 // verified before this function is called. Do not assume arbitrary client
 // pixels are safe: only allow the top 40 DIP of a positively admitted
@@ -616,15 +700,9 @@ fn centered_client_limit(frame:Rect,cover:Layout,client_top:i32,settings:bool)->
  if bottom<=client_top{return Some(client_top);}
  if settings&&cover.pos.y>=frame.top&&bottom<=frame.top+scale(40,cover.dpi){Some(bottom)}else{None}
 }
-fn settings_frame(h:H)->bool{
- match class_name(h).as_str(){
-  "ApplicationFrameWindow"=>has_settings_child(h)||query_name(identity(h).1).is_ok_and(|n|n=="systemsettings.exe"),
-  "Windows.UI.Core.CoreWindow"=>query_name(identity(h).1).is_ok_and(|n|n=="systemsettings.exe"),
-  _=>false,
- }
-}
+fn settings_frame(h:H)->bool{verified_settings_frame(h)}
 fn centered_band(h:H,frame:Rect,work:Rect,cover:Layout,settings:bool)->Option<CenteredBand>{unsafe{
- if style(h)&WS_CAPTION!=WS_CAPTION||GetForegroundWindow()!=h{return None;}
+ if GetForegroundWindow()!=h||(!settings&&style(h)&WS_CAPTION!=WS_CAPTION){return None;}
  let mut r=Rect::default();let mut origin=Point::default();
  if GetClientRect(h,&mut r)==0||r.width()<=0||r.height()<=0||ClientToScreen(h,&mut origin)==0{return None;}
  // Only the admitted Settings identity may use the extended client title.
@@ -694,8 +772,8 @@ fn present_blank(sprite:H,l:Layout,rows:&[u32])->bool{
  for (y,row) in pixels.chunks_exact_mut(l.w as usize).enumerate(){row.fill(0xff000000|rows[y]);}
  present_pixels(sprite,l,&pixels)
 }
-fn idle_target(h:H)->bool{unsafe{
- let (thread,_)=identity(h);if thread==0||GetAncestor(h,2)!=h||GetWindow(h,4)!=0{return false;}
+fn idle_target(h:H,allow_owned:bool)->bool{unsafe{
+ let (thread,_)=identity(h);if thread==0||!settings_owner_allowed(allow_owned,GetAncestor(h,2)==h,GetWindow(h,4)!=0)||IsWindowEnabled(h)==0{return false;}
  let mut info:GuiInfo=zeroed();info.size=size_of::<GuiInfo>() as u32;
  if GetGUIThreadInfo(thread,&mut info)==0||info.flags&0x1e!=0||info.capture!=0{return false;}
  let menu=GetSystemMenu(h,0);if menu!=0{let s=GetMenuState(menu,0xf060,0);if s!=0xffffffff&&s&3!=0{return false;}}
@@ -761,7 +839,7 @@ fn flat_color_patch(px:&[u32])->bool{
  px.len()==9&&px.iter().all(|p|[0,8,16].into_iter().all(|shift|((p>>shift)&255).abs_diff((px[4]>>shift)&255)<=8))
 }
 fn caption_sample_rows(h:H,l:Layout,frame:Rect,work:Rect,settings:bool)->Option<Vec<u32>>{
- if settings{settings_sample_rows(h,l,frame,work)}else{sample_rows(h,l)}
+ if settings{settings_sample_rows(h,l,frame,work).or_else(||sample_rows(h,l))}else{sample_rows(h,l)}
 }
 fn composite(dot:u32,bg:u32)->u32{
  let a=dot>>24;let c=|shift:u32|((dot>>shift&255)+((bg>>shift&255)*(255-a)+127)/255).min(255)<<shift;
@@ -784,24 +862,24 @@ fn update_title_cache(cache:&mut Option<Vec<u16>>,title:Option<&[u16]>){
  }
 }
 pub(super) struct Surface{
- request:Option<Request>,layout:Option<Layout>,generic_row:Option<Layout>,generic_fast_at:Instant,left:Option<Layout>,rows:Vec<u32>,hover:bool,shown:bool,cover_shown:bool,left_check:Instant,
- retry_at:Instant,last_sample:Instant,request_started:Instant,generic_retries:u8,blocked:Option<H>,misses:u32,office_title:Option<Vec<u16>>,ribbon_scan:Option<RibbonScan>,
- prefix_sprite:H,office_exact:bool,browser_left:bool,office_shift:Option<OfficeShift>,centered_generic:bool,settings_profile:bool,generic_band:Option<CenteredBand>,generic_center_at:Instant,generic_center_tries:u8,first_seen:Instant,first_reported:bool,
+ request:Option<Request>,layout:Option<Layout>,generic_row:Option<Layout>,generic_fast_at:Instant,left:Option<Layout>,rows:Vec<u32>,hover:bool,shown:bool,cover_shown:bool,resume_dirty:bool,left_check:Instant,
+ retry_at:Instant,last_sample:Instant,request_started:Instant,generic_retries:u8,blocked:Option<H>,misses:u32,miss_since:Option<Instant>,office_title:Option<Vec<u16>>,ribbon_scan:Option<RibbonScan>,
+ prefix_sprite:H,office_exact:bool,browser_left:bool,office_shift:Option<OfficeShift>,centered_generic:bool,settings_profile:bool,generic_band:Option<CenteredBand>,generic_center_at:Instant,generic_center_tries:u8,settings_hit_miss:Option<Instant>,first_seen:Instant,first_reported:bool,
  spacer_enabled:bool,spacer:Option<Layout>,spacer_key:Option<browser_spacer::Key>,spacer_checked:Option<Instant>,spacer_grace:Option<Instant>,spacer_rebased:bool,spacer_wait_until:Option<Instant>,
 }
 impl Surface{
- pub(super) fn new(prefix_sprite:H,office_exact:bool,browser_left:bool,spacer_enabled:bool,centered_generic:bool,settings_profile:bool)->Self{Self{prefix_sprite,office_exact,browser_left,office_shift:None,centered_generic,settings_profile,generic_band:None,generic_center_at:Instant::now(),generic_center_tries:0,first_seen:Instant::now(),first_reported:false,spacer_enabled,spacer:None,spacer_key:None,spacer_checked:None,spacer_grace:None,spacer_rebased:false,spacer_wait_until:None,request:None,layout:None,generic_row:None,generic_fast_at:Instant::now(),left:None,rows:Vec::new(),hover:false,shown:false,cover_shown:false,left_check:Instant::now(),retry_at:Instant::now(),last_sample:Instant::now(),request_started:Instant::now(),generic_retries:0,blocked:None,misses:0,office_title:None,ribbon_scan:None}}
+ pub(super) fn new(prefix_sprite:H,office_exact:bool,browser_left:bool,spacer_enabled:bool,centered_generic:bool,settings_profile:bool)->Self{Self{prefix_sprite,office_exact,browser_left,office_shift:None,centered_generic,settings_profile,generic_band:None,generic_center_at:Instant::now(),generic_center_tries:0,settings_hit_miss:None,first_seen:Instant::now(),first_reported:false,spacer_enabled,spacer:None,spacer_key:None,spacer_checked:None,spacer_grace:None,spacer_rebased:false,spacer_wait_until:None,request:None,layout:None,generic_row:None,generic_fast_at:Instant::now(),left:None,rows:Vec::new(),hover:false,shown:false,cover_shown:false,resume_dirty:false,left_check:Instant::now(),retry_at:Instant::now(),last_sample:Instant::now(),request_started:Instant::now(),generic_retries:0,blocked:None,misses:0,miss_since:None,office_title:None,ribbon_scan:None}}
  pub(super) fn clear(&mut self,sprite:H,cover:H){
   if self.shown{unsafe{ShowWindow(sprite,0);SetWindowPos(sprite,0,0,0,0,0,0x0217);}self.shown=false;}
   if let (Some(req),Some(scan))=(self.request,self.ribbon_scan){log(&format!("ribbon_slot_scan_reset hwnd={:#x} next_index={}",req.hwnd,scan.index));}
-  self.hide_prefix();self.hide_cover(cover);self.layout=None;self.generic_row=None;self.generic_fast_at=Instant::now();self.generic_center_at=Instant::now();self.generic_center_tries=0;self.left=None;self.request=None;self.rows=Vec::new();self.misses=0;self.request_started=Instant::now();self.generic_retries=0;self.office_title=None;self.ribbon_scan=None;self.spacer=None;self.spacer_key=None;self.spacer_checked=None;self.spacer_grace=None;self.spacer_rebased=false;self.spacer_wait_until=None;
+  self.resume_dirty=false;self.hide_prefix();self.hide_cover(cover);self.layout=None;self.generic_row=None;self.generic_fast_at=Instant::now();self.generic_center_at=Instant::now();self.generic_center_tries=0;self.settings_hit_miss=None;self.left=None;self.request=None;self.rows=Vec::new();self.misses=0;self.miss_since=None;self.request_started=Instant::now();self.generic_retries=0;self.office_title=None;self.ribbon_scan=None;self.spacer=None;self.spacer_key=None;self.spacer_checked=None;self.spacer_grace=None;self.spacer_rebased=false;self.spacer_wait_until=None;
  }
  fn hide_prefix(&mut self){let shifted=self.office_shift.take().is_some();let centered=self.generic_band.take().is_some();if shifted||centered{unsafe{ShowWindow(self.prefix_sprite,0);SetWindowPos(self.prefix_sprite,0,0,0,0,0,0x0217);}}}
  fn hide_cover(&mut self,cover:H){if self.cover_shown{unsafe{ShowWindow(cover,0);SetWindowPos(cover,0,0,0,0,0,0x0217);}self.cover_shown=false;}}
  pub(super) fn reset(&mut self,sprite:H,cover:H){self.clear(sprite,cover);self.blocked=None;self.retry_at=Instant::now();}
  pub(super) fn block_close(&mut self,h:H){self.blocked=Some(h);}
  pub(super) fn resume(&mut self){
-  self.blocked=None;self.generic_center_tries=0;self.generic_center_at=Instant::now();
+  self.resume_dirty=self.shown;self.blocked=None;self.settings_hit_miss=None;self.generic_center_tries=0;self.generic_center_at=Instant::now();
   if self.spacer.is_some(){
    self.spacer_grace=Some(Instant::now()+Duration::from_secs(4));
    // A very recent matching proof is still valid after a quick Alt+Tab.
@@ -809,10 +887,13 @@ impl Surface{
    if !self.spacer_checked.is_some_and(|t|t.elapsed()<browser_spacer::PERIOD){if let Some(k)=self.spacer_key.as_mut(){k.epoch=Instant::now();}}
   }
   if !self.shown{self.retry_at=Instant::now();}
-  self.last_sample=Instant::now();self.misses=0;
+  self.last_sample=Instant::now();self.misses=0;self.miss_since=None;
  }
  // Keep the fast timer for initial layout, incomplete scans, stale hits and
  // browser handoff. Steady-state verification retains its original deadlines.
+ pub(super) fn rearm_office(&mut self){
+  if !self.shown&&self.layout.is_some()&&self.left.is_none()&&self.office_title.is_some()&&self.ribbon_scan.is_none(){self.ribbon_scan=Some(RibbonScan::default());}
+ }
  pub(super) fn needs_fast_tick(&self,allow_left:bool)->bool{
   if allow_left&&self.centered_generic&&self.layout.is_some()&&self.generic_band.is_none(){return self.generic_center_tries<8;}
   !self.shown||self.misses>0||self.ribbon_scan.is_some()||self.spacer_wait_until.is_some()||
@@ -830,7 +911,7 @@ impl Surface{
   if let Some(r)=self.request.as_mut(){r.frame=frame;if let Some(h)=r.hint.as_mut(){h.left+=dx;h.right+=dx;h.top+=dy;h.bottom+=dy;}}
   if let Some(k)=self.spacer_key.as_mut(){if let Some(r)=self.request{k.req=r;}move_l(&mut k.right);k.epoch=Instant::now();}
  }
- fn reject_spacer(&mut self,cover:H){self.spacer=None;self.left=None;self.spacer_checked=None;self.spacer_grace=None;self.spacer_rebased=false;self.hide_cover(cover);self.misses=0;}
+ fn reject_spacer(&mut self,cover:H){self.spacer=None;self.left=None;self.spacer_checked=None;self.spacer_grace=None;self.spacer_rebased=false;self.hide_cover(cover);self.misses=0;self.miss_since=None;}
  fn spacer_fresh(&self)->bool{self.spacer_checked.is_some_and(|t|t.elapsed()<=browser_spacer::VALID)||self.spacer_grace.is_some_and(|t|Instant::now()<t)}
  // Rebase only a previously verified prefix, at unchanged DPI. Check real
  // right caption hit roles. Fresh UIA must confirm the new geometry.
@@ -847,7 +928,7 @@ impl Surface{
   self.layout=Some(r);self.left=Some(b);self.spacer=Some(m);self.request=Some(req);
   self.spacer_key=Some(browser_spacer::Key{req,right:r,work,count:key.count,epoch:Instant::now()});
   if !self.spacer_rebased{self.spacer_grace=Some(Instant::now()+Duration::from_secs(2));}
-  self.spacer_rebased=true;self.last_sample=Instant::now();self.misses=0;
+  self.spacer_rebased=true;self.last_sample=Instant::now();self.misses=0;self.miss_since=None;
   log(&format!("browser_spacer_rebase hwnd={:#x} mask={m:?}",req.hwnd));true
  }
 
@@ -864,7 +945,8 @@ impl Surface{
   let role=button_role(l,x,y)?;
   if self.left.is_some(){
    let mut title_buf=[0u16;1024];
-   if read_title_buf(req.hwnd,&mut title_buf)!=self.office_title.as_deref(){return None;}
+   let live_title=read_title_buf(req.hwnd,&mut title_buf);
+   if live_title!=self.office_title.as_deref()&&!(self.settings_profile&&live_title.is_none()&&self.office_title.is_some()){return None;}
    let hit=unsafe{hit_code(req.hwnd,Point{x:l.pos.x+x,y:l.pos.y+y})};
    if let Some(shift)=self.office_shift.as_ref(){if !matches!(hit,Some(2)|Some(3))||!caption_hits(req.hwnd,shift.original_slot){return None;}}
    else if self.generic_band.is_some(){if !matches!(hit,Some(2)|Some(3)){return None;}}
@@ -875,26 +957,44 @@ impl Surface{
  pub(super) fn tick(&mut self,d:&Dwm,h:H,app:App,sprite:H,cover:H,allow_left:bool){
   if unsafe{GetForegroundWindow()}!=h{return;}
   if !owner_presentable(d,h){self.clear(sprite,cover);return;}
-  let generic=app==App::GenericProbe;
-  if self.blocked==Some(h)||(!generic&&style(h)&(WS_CAPTION|BUTTON_BITS)!=(WS_CAPTION|BUTTON_BITS)){self.clear(sprite,cover);return;}
-  if generic&&unsafe{GetAncestor(h,2)!=h||GetWindow(h,4)!=0}{self.clear(sprite,cover);return;}
-  if !idle_target(h){if self.request.is_some_and(|r|visible_rect(d,h)==Some(r.frame)){return;}self.clear(sprite,cover);return;}
+  let mut generic=app==App::GenericProbe;
+  let office=app==App::OfficeProbe;
+  // Office can finish constructing its custom title bar after document launch.
+  // Do not require the stock WS_CAPTION bits: the worker still must prove all three roles.
+  if self.blocked==Some(h)||(!generic&&!office&&style(h)&(WS_CAPTION|BUTTON_BITS)!=(WS_CAPTION|BUTTON_BITS)){self.clear(sprite,cover);return;}
+  let settings=generic&&self.settings_profile;
+  let settings_verified=settings&&unsafe{GetWindow(h,4)!=0}&&settings_frame(h);
+  if generic&&!settings_owner_allowed(settings_verified,unsafe{GetAncestor(h,2)==h},unsafe{GetWindow(h,4)!=0}){self.clear(sprite,cover);return;}
+  let office_owned=office&&verified_owned_office_frame(h);
+  if !idle_target(h,settings_verified||office_owned){if self.request.is_some_and(|r|visible_rect(d,h)==Some(r.frame)){return;}self.clear(sprite,cover);return;}
   let Some(frame)=visible_rect(d,h)else{self.clear(sprite,cover);return;};
   let Some(info)=monitor_info(h)else{self.clear(sprite,cover);return;};
   let dpi=unsafe{GetDpiForWindow(h)}.max(96);if dpi>480||frame.width()<scale(340,dpi){self.clear(sprite,cover);return;}
-  let browser=app==App::BrowserProbe;
-  let settings=generic&&self.settings_profile;
-  let hint=if browser||generic{window_rect(h).zip(d.rect(h,5)).map(|(w,b)|Rect{left:w.left+b.left,top:w.top+b.top,right:w.left+b.right,bottom:w.top+b.bottom})}else{None};
+  let browser_app=app==App::BrowserProbe;
+  let mut plain_title_buf=[0u16;1024];
+  let plain_browser=browser_app&&plain_browser_native(h,frame,dpi,read_title_buf(h,&mut plain_title_buf));
+  if browser_app{self.centered_generic=plain_browser&&self.prefix_sprite!=0;}
+  generic|=plain_browser;
+  let browser=browser_app&&!plain_browser;
+  let hint=if browser||generic||office{window_rect(h).zip(d.rect(h,5)).map(|(w,b)|Rect{left:w.left+b.left,top:w.top+b.top,right:w.left+b.right,bottom:w.top+b.bottom})}else{None};
   let req=Request{hwnd:h,pid:identity(h).1,frame,dpi,browser,native_probe:generic,hint};
   let mut title_buf=[0u16;1024];
   let title=if allow_left&&(generic||app==App::OfficeProbe||(browser&&(self.browser_left||self.spacer_enabled))){read_title_buf(h,&mut title_buf)}else{None};
   let stable_browser=browser&&self.spacer_enabled&&allow_left;
   let selected_marker=stable_browser&&title.is_some_and(browser_spacer::marker_utf16);
   let mut rebased=false;
+  let mut title_changed=false;
   if self.request!=Some(req){
    if stable_browser&&!selected_marker&&self.rebase_spacer(req,info.work){rebased=true;}
    else{let was_left=stable_browser&&self.spacer.is_some()&&!selected_marker;self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now();if was_left{self.spacer_wait_until=Some(Instant::now()+Duration::from_secs(4));}}
-  }else if !stable_browser&&(self.office_title.is_some()||(generic&&allow_left&&self.layout.is_some()))&&self.office_title.as_deref()!=title{self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now();}
+  }else if office&&title.is_none()&&self.office_title.is_some(){
+   // A temporarily empty document title does not invalidate a verified frame.
+  }else if office&&self.office_title.as_deref()!=title&&self.office_shift.is_none(){
+   // A title change cannot move an already verified unshifted caption.
+   let first_title=self.office_title.is_none()&&title.is_some();
+   update_title_cache(&mut self.office_title,title);
+   if allow_left&&self.office_exact&&self.layout.is_some()&&self.left.is_none()&&self.ribbon_scan.is_none()&&(first_title||title.is_some()){self.ribbon_scan=Some(RibbonScan::default());self.last_sample=Instant::now();}
+  }else if settings||(generic&&self.generic_band.is_some()){if title.is_some()&&self.office_title.as_deref()!=title{update_title_cache(&mut self.office_title,title);title_changed=true;}}else if !stable_browser&&(self.office_title.is_some()||(generic&&allow_left&&self.layout.is_some()))&&self.office_title.as_deref()!=title{self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now();}
   if stable_browser{
    if selected_marker{if self.spacer.is_some(){self.reject_spacer(cover);unsafe{ShowWindow(sprite,0);}self.shown=false;log("browser_spacer_selected_marker");}self.spacer_key=None;}
    else if self.spacer_key.is_none(){if let (Some(l),Some(_))=(self.layout,title.as_ref()){if let Ok(exe)=query_name(req.pid){let count=match exe.as_str(){"brave.exe"=>3,"msedge.exe"=>2,_=>0};if count>0{self.spacer_key=Some(browser_spacer::Key{req,right:l,work:info.work,count,epoch:Instant::now()});}}}}
@@ -905,10 +1005,15 @@ impl Surface{
    // A bounded direct DWM/role check bypasses the worker queue on fresh
    // allowlisted generic frames. If it cannot prove the geometry, use the
    // existing asynchronous verifier; never paint guessed bounds.
-   let fast=if generic&&Instant::now()>=self.generic_fast_at{self.generic_fast_at=Instant::now()+Duration::from_millis(100);unsafe{quick_generic_hint(req)}}else{None};
+   let fast=if (generic||office)&&Instant::now()>=self.generic_fast_at{self.generic_fast_at=Instant::now()+Duration::from_millis(100);unsafe{quick_generic_hint(Request{native_probe:true,..req})}}else{None};
    let Some(verified)=fast.or_else(||poll(req,true))else{return;};
    let r=verified;
-   let r=if generic{let Some(full)=generic_visual_envelope(r,req.hint,frame,info.work,dpi)else{log(&format!("generic_cover_conflict hwnd={h:#x} verified={r:?} hint={:?}",req.hint));self.retry_at=Instant::now()+Duration::from_millis(250);return;};if full!=r{log(&format!("generic_cover_expanded hwnd={h:#x} verified={r:?} full={full:?}"));}full}else{r};
+   let r=if plain_browser{
+    let mut origin=Point::default();
+    let full=if unsafe{ClientToScreen(h,&mut origin)}!=0{plain_browser_cover(r,req.hint,frame,info.work,dpi,origin.y)}else{None};
+    let Some(full)=full else{log(&format!("browser_plain_cover_unverified hwnd={h:#x} keep_stock=true"));self.retry_at=Instant::now()+Duration::from_millis(500);return;};
+    log(&format!("browser_plain_cover_verified hwnd={h:#x} roles={r:?} full={full:?}"));full
+   }else if generic||(office&&fast.is_some()){let Some(full)=generic_visual_envelope(r,req.hint,frame,info.work,dpi)else{log(&format!("generic_cover_conflict hwnd={h:#x} verified={r:?} hint={:?}",req.hint));self.retry_at=Instant::now()+Duration::from_millis(250);return;};if full!=r{log(&format!("generic_cover_expanded hwnd={h:#x} verified={r:?} full={full:?}"));}full}else{r};
    let Some(l)=candidate_layout(r,frame,info.work,dpi)else{log(&format!("custom_skip hwnd={h:#x} app={app:?} reason=caption_outside_workarea rect={r:?}"));self.retry_at=Instant::now()+Duration::from_millis(if generic{100}else{500});return;};
    let Some(rows)=caption_sample_rows(h,l,frame,info.work,settings)else{log(&format!("custom_skip hwnd={h:#x} app={app:?} reason=background_unavailable"));self.retry_at=Instant::now()+Duration::from_millis(if generic{80}else{500});return;};
    if !unsafe{active(req)}||visible_rect(d,h)!=Some(frame){return;}
@@ -935,7 +1040,7 @@ impl Surface{
      update_title_cache(&mut self.office_title,title);
      log(&format!("generic_centered_verified hwnd={h:#x} margin_dip={LEFT_MARGIN_DIP} band={band:?}"));
     }else{update_title_cache(&mut self.office_title,title);log(&format!("generic_centered_wait hwnd={h:#x} reason=nonclient_or_hit_validation"));}
-   }else if allow_left&&(generic||(app==App::OfficeProbe&&title.is_some())){
+   }else if allow_left&&((generic&&!plain_browser)||(app==App::OfficeProbe&&title.is_some())){
     self.ribbon_scan=Some(RibbonScan::default());
     log(&format!("ribbon_slot_scan_start hwnd={h:#x} candidates={} order=horizontal_first",OFFICE_OFFSETS.len()*3));
     update_title_cache(&mut self.office_title,title);
@@ -944,7 +1049,7 @@ impl Surface{
   let Some(l)=self.layout else{return;};
   // Recheck the left drag slot while active: tab/QAT changes need not move the HWND.
   // If it stops being a drag region, immediately return to the verified right layout.
-  let mut switched=rebased;
+  let mut switched=rebased||title_changed||self.resume_dirty;
   // A startup frame can be incomplete even though the previous role group
   // was valid. Upgrade a fallback once the real nonclient title becomes ready.
   if allow_left&&generic&&self.centered_generic&&self.prefix_sprite!=0&&title.is_some()&&self.generic_band.is_none()&&Instant::now()>=self.generic_center_at{
@@ -966,40 +1071,52 @@ impl Surface{
    }
    if mask!=self.spacer{
     if let Some(m)=mask{self.spacer=Some(m);self.left=browser_spacer::button_layout(m);}else{self.reject_spacer(cover);}
-    switched=true;self.misses=0;
+    switched=true;self.misses=0;self.miss_since=None;
     log(&format!("browser_spacer_layout hwnd={h:#x} mask={mask:?} fallback_right={}",mask.is_none()));
    }
   }
-  if let Some(scan)=self.ribbon_scan.as_mut(){
-   let (slot,done)=if generic{scan.step_generic(h,self.generic_row.unwrap_or(l),l,frame,info.work)}else{
-    let start=Instant::now();let mut result=(None,false);
-    for _ in 0..4{result=scan.step(h,l,frame,info.work,false);if result.1||start.elapsed()>=Duration::from_millis(25){break;}}
-    result
-   };
-   if done{self.ribbon_scan=None;log(&format!("custom_left_probe hwnd={h:#x} app={app:?} verified={} fallback_right={}",slot.is_some(),slot.is_none()));}
-   if let Some(slot)=slot{
-    self.left=Some(slot);
-    if self.office_exact&&app==App::OfficeProbe{
-     match make_office_shift(h,slot,l,frame,info.work){
-      Ok((exact,shift))=>{self.left=Some(exact);self.office_shift=Some(shift);log(&format!("office_exact_left_verified hwnd={h:#x} rect={exact:?} visual_only=true"));}
-      Err(reason)=>log(&format!("office_exact_left_fallback hwnd={h:#x} reason={reason} near_left=true")),
-     }
-    }
-    self.left_check=Instant::now();switched=true;
+  if let Some(mut scan)=self.ribbon_scan.take(){
+   if office&&self.office_exact{
+    // One row per manager tick. No repeated 105-position scan; a settled
+    // right fallback is not rescanned merely on focus changes.
+    let dy=[0,2,-2].get(scan.index).copied();scan.index+=1;
+    let result=dy.and_then(|dy|office_exact_row(h,l,frame,info.work,dy));
+    if let Some((exact,shift))=result{
+     self.left=Some(exact);self.office_shift=shift;self.left_check=Instant::now();switched=true;
+     log(&format!("office_exact_left_verified hwnd={h:#x} rect={:?}",self.left));
+    }else if scan.index>=3{log(&format!("office_no_safe_left hwnd={h:#x} stable_right=true"));}
+    else{self.ribbon_scan=Some(scan);}
+
+   }else{
+    let (slot,done)=if generic{scan.step_generic(h,self.generic_row.unwrap_or(l),l,frame,info.work)}else{
+     let start=Instant::now();let mut result=(None,false);
+     for _ in 0..4{result=scan.step(h,l,frame,info.work,false);if result.1||start.elapsed()>=Duration::from_millis(25){break;}}
+     result
+    };
+    if !done{self.ribbon_scan=Some(scan);}
+    else{log(&format!("custom_left_probe hwnd={h:#x} app={app:?} verified={} fallback_right={}",slot.is_some(),slot.is_none()));}
+    if let Some(slot)=slot{self.left=Some(slot);self.left_check=Instant::now();switched=true;}
    }
   }
   if let Some(left)=self.left{if self.spacer.is_none()&&self.left_check.elapsed()>=Duration::from_millis(if browser{200}else{300}){
    self.left_check=Instant::now();
    let verify_slot=self.office_shift.as_ref().map_or(left,|s|s.original_slot);
-   if !(if self.generic_band.is_some(){centered_button_hits(h,left)}else{caption_hits(h,verify_slot)})||(self.office_shift.is_some()&&!exact_button_hits(h,left)){if unsafe{GetForegroundWindow()}!=h{return;}self.left=None;if generic&&self.centered_generic{self.generic_center_tries=0;self.generic_center_at=Instant::now();}else if generic&&self.generic_retries<1{self.generic_retries+=1;self.ribbon_scan=Some(RibbonScan::default());}self.hide_prefix();self.hide_cover(cover);unsafe{ShowWindow(sprite,0);}self.shown=false;self.misses=0;switched=true;log(&format!("custom_left_revert hwnd={h:#x} reason=slot_changed"));}
+   let valid=if settings&&self.generic_band.is_some(){match settings_left_roles(h,left){
+    Some(ok)=>{self.settings_hit_miss=None;ok},None=>{
+     let since=*self.settings_hit_miss.get_or_insert_with(Instant::now);
+     if since.elapsed()<Duration::from_millis(200){self.left_check=Instant::now()-Duration::from_millis(260);return;}
+     self.settings_hit_miss=None;false
+    }
+   }}else if self.generic_band.is_some(){centered_button_hits(h,left)}else{caption_hits(h,verify_slot)};
+   if !valid||(self.office_shift.is_some()&&!exact_button_hits(h,left)){if unsafe{GetForegroundWindow()}!=h{return;}self.left=None;if generic&&self.centered_generic{self.generic_center_tries=0;self.generic_center_at=Instant::now();}else if (generic||office)&&self.generic_retries<1{self.generic_retries+=1;self.ribbon_scan=Some(RibbonScan::default());}self.hide_prefix();self.hide_cover(cover);unsafe{ShowWindow(sprite,0);}self.shown=false;self.misses=0;self.miss_since=None;switched=true;log(&format!("custom_left_revert hwnd={h:#x} reason=slot_changed"));}
   }}
   // A known full-title profile must not jump to the right or to a slot
   // after its old title. Keep the stock caption until the left/center proof
   // is available; retry at a bounded cadence instead of masking controls.
-  if allow_left&&generic&&self.centered_generic&&self.generic_band.is_none(){return;}
+  if allow_left&&generic&&self.centered_generic&&self.generic_band.is_none()&&centered_profile_wait(settings||plain_browser,self.request_started.elapsed()){return;}
   if !self.shown&&self.left.is_none(){
    let age=self.last_sample.elapsed();
-   if self.ribbon_scan.is_some()&&(generic||age<Duration::from_millis(180)){return;}
+   if self.ribbon_scan.is_some()&&(generic||(office&&self.office_exact)||age<Duration::from_millis(180)){return;}
    if self.spacer_key.is_some()&&self.spacer.is_none()&&age<Duration::from_millis(250){return;}
   }
   if !unsafe{active(req)}{return;}if visible_rect(d,h)!=Some(frame){return;}
@@ -1009,11 +1126,12 @@ impl Surface{
   let mut changed=switched;
   if self.ribbon_scan.is_none()&&self.last_sample.elapsed()>=Duration::from_secs(if stable_browser{3}else{2}){
    self.last_sample=Instant::now();
-   if let Some(rows)=caption_sample_rows(h,l,frame,info.work,settings){if rows!=self.rows{
+   let refreshed=if settings{settings_sample_rows(h,l,frame,info.work)}else{caption_sample_rows(h,l,frame,info.work,false)};
+   if let Some(rows)=refreshed{if rows!=self.rows{
     if settings{log(&format!("settings_body_color hwnd={h:#x} rgb={:06x}",rows[0]));}
     if self.office_shift.is_some(){self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now()+Duration::from_millis(160);log("office_exact_left_theme_refresh");return;}
     self.rows=rows;changed=true;
-   }}else if !stable_browser&&!settings{self.clear(sprite,cover);self.retry_at=Instant::now()+Duration::from_millis(if generic{100}else{500});return;}
+   }}else if !stable_browser&&!settings{log("caption_sample_deferred_keep_verified_surface");}
   }
   let auxiliary_hidden=unsafe{(self.left.is_some()&&(!self.cover_shown||IsWindowVisible(cover)==0))||((self.generic_band.is_some()||self.office_shift.is_some())&&IsWindowVisible(self.prefix_sprite)==0)};
   if auxiliary_hidden&&self.shown{log(&format!("caption_auxiliary_recover hwnd={h:#x}"));}
@@ -1038,15 +1156,15 @@ impl Surface{
    if !rendered||visible_rect(d,h)!=Some(frame)||unsafe{SetWindowPos(sprite,0,surface.pos.x,surface.pos.y,0,0,0x0251)}==0{
     unsafe{ShowWindow(sprite,0);}self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now()+Duration::from_millis(if generic{100}else{500});log("custom_present_failed; stock unchanged");return;
    }
-   if generic&&!self.first_reported{self.first_reported=true;log(&format!("generic_session_first_present hwnd={h:#x} elapsed_ms={} centered={}",self.first_seen.elapsed().as_millis(),self.generic_band.is_some()));}
+   if generic&&!self.first_reported{self.first_reported=true;log(&format!("generic_session_first_present hwnd={h:#x} elapsed_ms={} centered={} settings={settings}",self.first_seen.elapsed().as_millis(),self.generic_band.is_some()));}
    if !self.shown{log(&format!("custom_first_present hwnd={h:#x} app={app:?} elapsed_ms={} left={}",self.request_started.elapsed().as_millis(),self.left.is_some()));}
    if !self.shown||switched{log(&format!("custom_present hwnd={h:#x} app={app:?} rect={buttons:?} left={} mode=verified_cover stock_style_unchanged=true",self.left.is_some()));}
-   self.shown=true;self.hover=hover;
+   self.shown=true;self.hover=hover;self.resume_dirty=false;
   }
   if unsafe{GetForegroundWindow()}!=h{return;}
   let mid=Point{x:buttons.pos.x+buttons.w/2,y:buttons.pos.y+buttons.h/2};
   let cover_ok=!self.cover_shown||unsafe{WindowFromPoint(Point{x:l.pos.x+l.w/2,y:l.pos.y+l.h/2})}==cover;
-  if cover_ok&&unsafe{WindowFromPoint(mid)}==sprite{self.misses=0;}else{self.misses+=1;if self.misses>=15{log("custom_covered; stock unchanged");self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now()+Duration::from_millis(if generic{100}else{500});}}
+  if cover_ok&&unsafe{WindowFromPoint(mid)}==sprite{self.misses=0;self.miss_since=None;}else{self.misses=self.misses.saturating_add(1);if coverage_expired(&mut self.miss_since,Instant::now()){log("custom_covered; stock unchanged");self.clear(sprite,cover);self.request=Some(req);self.retry_at=Instant::now()+Duration::from_millis(if generic{100}else{500});}}
  }
 }
 #[cfg(test)] mod surface_tests{use super::*;
@@ -1102,4 +1220,19 @@ impl Surface{
  #[test] fn maximized_envelope_clips_hidden_borders(){let f=Rect{left:-8,top:-8,right:1928,bottom:1088};let w=Rect{left:0,top:0,right:1920,bottom:1080};let v=Rect{left:1817,top:4,right:1920,bottom:26};let raw=Rect{left:1774,top:-4,right:1924,bottom:26};assert_eq!(generic_visual_envelope(v,Some(raw),f,w,96),Some(Rect{left:1774,top:0,right:1920,bottom:26}));assert!(generic_visual_envelope(v,Some(raw),f,Rect{top:24,..w},96).is_none());}
  #[test] fn compact_row_still_fits_centered_buttons(){let f=Rect{left:0,top:0,right:900,bottom:700};let l=Layout{pos:Point{x:797,y:8},w:103,h:22,dpi:96,work_top:Some(0),fallback_row:false,left_slot:false};let b=centered_band_geometry(f,f,l,30).unwrap();assert_eq!(b.buttons.pos,Point{x:8,y:8});}
  #[test] fn settings_sample_rejects_icons_and_accepts_flat(){assert!(flat_color_patch(&[0x181818;9]));let mut p=[0x181818;9];p[2]=0xffffff;assert!(!flat_color_patch(&p));assert!(!flat_color_patch(&p[..8]));}
+}
+
+#[cfg(test)] mod office_settings_regression_tests{use super::*;
+ #[test]fn exact_office_rejects_middle_slots(){let f=Rect{left:100,top:24,right:1400,bottom:900};let l=Layout{pos:Point{x:108,y:24},w:66,h:22,dpi:96,work_top:Some(24),fallback_row:false,left_slot:true};assert!(office_exact_edge(l,f,f));assert!(office_exact_edge(Layout{pos:Point{x:103,y:24},..l},f,f));assert!(!office_exact_edge(Layout{pos:Point{x:580,y:24},..l},f,f));}
+ #[test]fn settings_verified_right_can_show_after_grace(){assert!(centered_profile_wait(true,Duration::from_millis(399)));assert!(!centered_profile_wait(true,Duration::from_millis(400)));assert!(centered_profile_wait(false,Duration::from_secs(5)));}
+}
+
+#[cfg(test)] mod office_long_title_tests{use super::*;
+ #[test]fn long_title_gap_detected(){let mut row=vec![0x00123456;800];for x in (12..565).step_by(5){row[x]=0xffffff;}let pixels=row.repeat(22);assert!(!flat_window_in_strip(&pixels,800,22,296,66));assert!(flat_window_in_strip(&pixels,800,22,568,66));assert!(!flat_window_in_strip(&pixels,800,22,780,66));}
+ #[test]fn strip_rejects_occupied_gap(){let mut pixels=vec![0x00123456;800*22];pixels[10*800+600]=0xffffff;assert!(!flat_window_in_strip(&pixels,800,22,568,66));assert!(flat_window_in_strip(&pixels,800,22,630,66));}
+}
+
+#[cfg(test)] mod browser_plain_tests{use super::*;
+ #[test]fn exact_profile_title_not_document_title(){assert!(browser_plain_title(&wide("Brave")[..5]));assert!(!browser_plain_title(&"Document - Brave".encode_utf16().collect::<Vec<_>>()));assert!(!browser_plain_title(&"Brave Search".encode_utf16().collect::<Vec<_>>()));}
+ #[test]fn native_picker_covers_full_stock_group(){let f=Rect{left:8,top:6,right:1032,bottom:795};let b=Rect{left:886,top:6,right:1032,bottom:36};let v=Rect{left:929,top:14,right:1032,bottom:36};assert_eq!(plain_browser_cover(v,Some(b),f,f,96,36),Some(b));assert_eq!(plain_browser_cover(v,None,f,f,96,36),None);assert_eq!(plain_browser_cover(v,Some(b),f,f,96,30),None);}
 }
